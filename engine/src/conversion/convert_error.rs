@@ -34,14 +34,22 @@ pub enum ConvertError {
     NotOneInputReference(String),
     UnsupportedType(String),
     UnknownType(String),
-    OpaqueTypeFound,
     StaticData(String),
     InfinitelyRecursiveTypedef(QualifiedName),
     UnexpectedUseStatement(Option<Ident>),
     TemplatedTypeContainingNonPathArg(QualifiedName),
     InvalidPointee,
     DidNotGenerateAnything(String),
-    UnacceptableStdType(QualifiedName),
+    TypeContainingForwardDeclaration(QualifiedName),
+    Blocked(QualifiedName),
+    UnusedTemplateParam,
+    TooManyUnderscores,
+    UnknownDependentType,
+    IgnoredDependent,
+    MoveConstructorUnsupported,
+    ReservedName,
+    DuplicateCxxBridgeName,
+    UnsupportedReceiver,
 }
 
 fn format_maybe_identifier(id: &Option<Ident>) -> String {
@@ -68,19 +76,28 @@ impl Display for ConvertError {
             ConvertError::NotOneInputReference(fn_name) => write!(f, "Function {} has a return reference parameter, but 0 or >1 input reference parameters, so the lifetime of the output reference cannot be deduced.", fn_name)?,
             ConvertError::UnsupportedType(ty_desc) => write!(f, "Encountered type not yet supported by autocxx: {}", ty_desc)?,
             ConvertError::UnknownType(ty_desc) => write!(f, "Encountered type not yet known by autocxx: {}", ty_desc)?,
-            ConvertError::OpaqueTypeFound => write!(f, "Bindgen generated an opaque type (an empty array) somewhere other than a typedef")?,
             ConvertError::StaticData(ty_desc) => write!(f, "Encountered mutable static data, not yet supported: {}", ty_desc)?,
             ConvertError::InfinitelyRecursiveTypedef(tn) => write!(f, "Encountered typedef to itself - this is a known bindgen bug: {}", tn.to_cpp_name())?,
             ConvertError::UnexpectedUseStatement(maybe_ident) => write!(f, "Unexpected 'use' statement encountered: {}", format_maybe_identifier(maybe_ident))?,
             ConvertError::TemplatedTypeContainingNonPathArg(tn) => write!(f, "Type {} was parameterized over something complex which we don't yet support", tn)?,
             ConvertError::InvalidPointee => write!(f, "Pointer pointed to something unsupported")?,
             ConvertError::DidNotGenerateAnything(directive) => write!(f, "The 'generate' or 'generate_pod' directive for '{}' did not result in any code being generated. Perhaps this was mis-spelled or you didn't qualify the name with any namespaces? Otherwise please report a bug.", directive)?,
-            ConvertError::UnacceptableStdType(tn) => write!(f, "The std type '{}' is not yet supported", tn.to_cpp_name())?,
+            ConvertError::TypeContainingForwardDeclaration(tn) => write!(f, "Found an attempt at using a forward declaration ({}) inside a templated cxx type such as UniquePtr or CxxVector", tn.to_cpp_name())?,
+            ConvertError::Blocked(tn) => write!(f, "Found an attempt at using a type marked as blocked! ({})", tn.to_cpp_name())?,
+            ConvertError::UnusedTemplateParam => write!(f, "This function or method uses a type where one of the template parameters was incomprehensible to bindgen/autocxx - probably because it uses template specialization.")?,
+            ConvertError::TooManyUnderscores => write!(f, "Names containing __ are reserved by C++ so not acceptable to cxx")?,
+            ConvertError::UnknownDependentType => write!(f, "This item relies on a type not known to autocxx.")?,
+            ConvertError::IgnoredDependent => write!(f, "This item depends on some other type which autocxx could not generate.")?,
+            ConvertError::MoveConstructorUnsupported => write!(f, "This is a move constructor, for which we currently cannot generate bindings.")?,
+            ConvertError::ReservedName => write!(f, "The item name is a reserved word in Rust.")?,
+            ConvertError::DuplicateCxxBridgeName => write!(f, "This item name is used in multiple namespaces. At present, autocxx and cxx allow only one type of a given name. This limitation will be fixed in future.")?,
+            ConvertError::UnsupportedReceiver => write!(f, "This is a method on a type which can't be used as the receiver in Rust (i.e. self/this). This is probably because some type involves template specialization.")?,
         }
         Ok(())
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum ErrorContext {
     Item(Ident),
     Method { self_ty: Ident, method: Ident },

@@ -19,12 +19,13 @@ use crate::conversion::{
     convert_error::ErrorContext,
 };
 use crate::{
-    conversion::api::ApiDetail,
     conversion::ConvertError,
     types::{Namespace, QualifiedName},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use syn::{Block, Expr, ExprCall, ForeignItem, Ident, ImplItem, ItemImpl, Stmt, Type};
+
+use super::parse_bindgen::api_name;
 
 /// Parses a given bindgen-generated 'mod' into suitable
 /// [Api]s. In bindgen output, a given mod concerns
@@ -128,10 +129,10 @@ impl ParseForeignMod {
         while !self.funcs_to_convert.is_empty() {
             let mut fun = self.funcs_to_convert.remove(0);
             fun.self_ty = self.method_receivers.get(&fun.item.sig.ident).cloned();
-            apis.push(UnanalyzedApi {
-                name: QualifiedName::new(&self.ns, fun.item.sig.ident.clone()),
-                deps: HashSet::new(), // filled in later - TODO make compile-time safe
-                detail: ApiDetail::Function { fun, analysis: () },
+            apis.push(UnanalyzedApi::Function {
+                name: api_name(&self.ns, fun.item.sig.ident.clone(), &fun.item.attrs),
+                fun: Box::new(fun),
+                analysis: (),
             })
         }
     }

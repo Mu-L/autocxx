@@ -15,11 +15,12 @@
 mod function_wrapper_cpp;
 pub(crate) mod type_to_cpp;
 
-use crate::types::QualifiedName;
+use crate::{types::QualifiedName, CppFilePair};
+use autocxx_parser::IncludeCppConfig;
 use itertools::Itertools;
 use std::collections::HashSet;
 use syn::Type;
-use type_to_cpp::type_to_cpp;
+use type_to_cpp::{original_name_map_from_apis, type_to_cpp, CppNameMap};
 
 use super::{
     analysis::fun::{
@@ -67,18 +68,9 @@ impl Header {
 }
 
 struct AdditionalFunction {
-    type_definition: String, // are output before main declarations
-    declaration: String,
-    definition: String,
+    type_definition: Option<String>, // are output before main declarations
+    declaration: Option<String>,
     headers: Vec<Header>,
-}
-
-/// Details of additional generated C++.
-pub(crate) struct CppCodegenResults {
-    /// Declarations, for inclusion in some suitable header file.
-    pub(crate) declarations: String,
-    /// Definitions, for inclusion in some suitable compilation unit.
-    pub(crate) definitions: String,
 }
 
 /// Generates additional C++ glue functions needed by autocxx.
@@ -87,25 +79,34 @@ pub(crate) struct CppCodegenResults {
 /// generates, and perhaps we'll explore that in future. But for now,
 /// autocxx generates its own _additional_ C++ files which therefore
 /// need to be built and included in linking procedures.
-pub(crate) struct CppCodeGenerator {
+pub(crate) struct CppCodeGenerator<'a> {
     additional_functions: Vec<AdditionalFunction>,
     inclusions: String,
+    original_name_map: CppNameMap,
+    config: &'a IncludeCppConfig,
 }
 
-impl CppCodeGenerator {
+impl<'a> CppCodeGenerator<'a> {
     pub(crate) fn generate_cpp_code(
         inclusions: String,
         apis: &[Api<FnAnalysis>],
-    ) -> Result<Option<CppCodegenResults>, ConvertError> {
-        let mut gen = CppCodeGenerator::new(inclusions);
+        config: &'a IncludeCppConfig,
+    ) -> Result<Option<CppFilePair>, ConvertError> {
+        let mut gen = CppCodeGenerator::new(inclusions, original_name_map_from_apis(apis), config);
         gen.add_needs(apis.iter().filter_map(|api| api.additional_cpp()))?;
         Ok(gen.generate())
     }
 
-    fn new(inclusions: String) -> Self {
+    fn new(
+        inclusions: String,
+        original_name_map: CppNameMap,
+        config: &'a IncludeCppConfig,
+    ) -> Self {
         CppCodeGenerator {
             additional_functions: Vec::new(),
             inclusions,
+            original_name_map,
+            config,
         }
     }
 
@@ -121,14 +122,14 @@ impl CppCodeGenerator {
                 }
                 AdditionalNeed::CTypeTypedef(tn) => self.generate_ctype_typedef(&tn),
                 AdditionalNeed::ConcreteTemplatedTypeTypedef(tn, def) => {
-                    self.generate_typedef(&tn, type_to_cpp(&def)?)
+                    self.generate_typedef(&tn, type_to_cpp(&def, &self.original_name_map)?)
                 }
             }
         }
         Ok(())
     }
 
-    fn generate(&self) -> Option<CppCodegenResults> {
+    fn generate(&self) -> Option<CppFilePair> {
         if self.additional_functions.is_empty() {
             None
         } else {
@@ -139,46 +140,42 @@ impl CppCodeGenerator {
                 .flatten()
                 .collect();
             let headers = headers.iter().map(|x| x.include_stmt()).join("\n");
-            let type_definitions = self.concat_additional_items(|x| &x.type_definition);
-            let declarations = self.concat_additional_items(|x| &x.declaration);
+            let type_definitions = self.concat_additional_items(|x| x.type_definition.as_ref());
+            let declarations = self.concat_additional_items(|x| x.declaration.as_ref());
             let declarations = format!(
-                "{}\n{}\n{}\n{}",
+                "#ifndef __AUTOCXXGEN_H__\n#define __AUTOCXXGEN_H__\n\n{}\n{}\n{}\n{}#endif // __AUTOCXXGEN_H__\n",
                 headers, self.inclusions, type_definitions, declarations
             );
-            let definitions = self.concat_additional_items(|x| &x.definition);
-            let definitions = format!("#include \"autocxxgen.h\"\n{}", definitions);
-            Some(CppCodegenResults {
-                declarations,
-                definitions,
+            log::info!("Additional C++ decls:\n{}", declarations);
+            let header_name = format!("autocxxgen_{}.h", self.config.get_mod_name());
+            Some(CppFilePair {
+                header: declarations.into_bytes(),
+                implementation: None,
+                header_name,
             })
         }
     }
 
     fn concat_additional_items<F>(&self, field_access: F) -> String
     where
-        F: FnMut(&AdditionalFunction) -> &str,
+        F: FnMut(&AdditionalFunction) -> Option<&String>,
     {
         let mut s = self
             .additional_functions
             .iter()
             .map(field_access)
-            .collect::<Vec<&str>>()
+            .flatten()
             .join("\n");
         s.push('\n');
         s
     }
 
     fn generate_string_constructor(&mut self) {
-        let declaration = "std::unique_ptr<std::string> make_string(::rust::Str str)";
-        let definition = format!(
-            "{} {{ return std::make_unique<std::string>(std::string(str)); }}",
-            declaration
-        );
-        let declaration = format!("{};", declaration);
+        let makestring_name = self.config.get_makestring_name();
+        let declaration = Some(format!("inline std::unique_ptr<std::string> {}(::rust::Str str) {{ return std::make_unique<std::string>(std::string(str)); }}", makestring_name));
         self.additional_functions.push(AdditionalFunction {
-            type_definition: "".into(),
+            type_definition: None,
             declaration,
-            definition,
             headers: vec![
                 Header::system("memory"),
                 Header::system("string"),
@@ -218,7 +215,7 @@ impl CppCodeGenerator {
             .map(|(counter, ty)| {
                 Ok(format!(
                     "{} {}",
-                    ty.unconverted_type()?,
+                    ty.unconverted_type(&self.original_name_map)?,
                     get_arg_name(counter)
                 ))
             })
@@ -227,13 +224,17 @@ impl CppCodeGenerator {
         let ret_type = details
             .return_conversion
             .as_ref()
-            .map_or(Ok("void".to_string()), |x| x.converted_type())?;
+            .map_or(Ok("void".to_string()), |x| {
+                x.converted_type(&self.original_name_map)
+            })?;
         let declaration = format!("{} {}({})", ret_type, name, args);
         let arg_list: Result<Vec<_>, _> = details
             .argument_conversion
             .iter()
             .enumerate()
-            .map(|(counter, conv)| conv.cpp_conversion(&get_arg_name(counter)))
+            .map(|(counter, conv)| {
+                conv.cpp_conversion(&get_arg_name(counter), &self.original_name_map)
+            })
             .collect();
         let mut arg_list = arg_list?.into_iter();
         let receiver = if is_a_method { arg_list.next() } else { None };
@@ -261,15 +262,18 @@ impl CppCodeGenerator {
             }
         };
         if let Some(ret) = &details.return_conversion {
-            underlying_function_call =
-                format!("return {}", ret.cpp_conversion(&underlying_function_call)?);
+            underlying_function_call = format!(
+                "return {}",
+                ret.cpp_conversion(&underlying_function_call, &self.original_name_map)?
+            );
         };
-        let definition = format!("{} {{ {}; }}", declaration, underlying_function_call,);
-        let declaration = format!("{};", declaration);
+        let declaration = Some(format!(
+            "inline {} {{ {}; }}",
+            declaration, underlying_function_call,
+        ));
         self.additional_functions.push(AdditionalFunction {
-            type_definition: "".into(),
+            type_definition: None,
             declaration,
-            definition,
             headers: vec![Header::system("memory")],
         });
         Ok(())
@@ -283,9 +287,8 @@ impl CppCodeGenerator {
     fn generate_typedef(&mut self, tn: &QualifiedName, definition: String) {
         let our_name = tn.get_final_item();
         self.additional_functions.push(AdditionalFunction {
-            type_definition: format!("typedef {} {};", definition, our_name),
-            declaration: "".into(),
-            definition: "".into(),
+            type_definition: Some(format!("typedef {} {};", definition, our_name)),
+            declaration: None,
             headers: Vec::new(),
         })
     }

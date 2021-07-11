@@ -16,24 +16,35 @@ mod byvalue_checker;
 
 use std::collections::HashSet;
 
-use autocxx_parser::TypeConfig;
+use autocxx_parser::IncludeCppConfig;
 use byvalue_checker::ByValueChecker;
-use syn::{Item, ItemStruct};
+use syn::{ItemEnum, ItemStruct, Type};
 
 use crate::{
     conversion::{
-        api::{Api, ApiAnalysis, ApiDetail, TypeKind, UnanalyzedApi},
+        analysis::type_converter::{add_analysis, TypeConversionContext, TypeConverter},
+        api::{AnalysisPhase, Api, ApiName, TypeKind, UnanalyzedApi},
         codegen_rs::make_non_pod,
-        parse::type_converter::TypeConverter,
+        convert_error::{ConvertErrorWithContext, ErrorContext},
+        error_reporter::convert_apis,
         ConvertError,
     },
     types::{Namespace, QualifiedName},
 };
 
+use super::tdef::{TypedefAnalysis, TypedefAnalysisBody};
+
+pub(crate) struct PodStructAnalysisBody {
+    pub(crate) kind: TypeKind,
+    pub(crate) bases: HashSet<QualifiedName>,
+    pub(crate) field_deps: HashSet<QualifiedName>,
+}
+
 pub(crate) struct PodAnalysis;
 
-impl ApiAnalysis for PodAnalysis {
-    type TypeAnalysis = TypeKind;
+impl AnalysisPhase for PodAnalysis {
+    type TypedefAnalysis = TypedefAnalysisBody;
+    type StructAnalysis = PodStructAnalysisBody;
     type FunAnalysis = ();
 }
 
@@ -43,91 +54,102 @@ impl ApiAnalysis for PodAnalysis {
 /// and an object which can be used to query the POD status of any
 /// type whether or not it's one of the [Api]s.
 pub(crate) fn analyze_pod_apis(
-    apis: Vec<UnanalyzedApi>,
-    type_config: &TypeConfig,
-    type_converter: &mut TypeConverter,
+    apis: Vec<Api<TypedefAnalysis>>,
+    config: &IncludeCppConfig,
 ) -> Result<Vec<Api<PodAnalysis>>, ConvertError> {
     // This next line will return an error if any of the 'generate_pod'
     // directives from the user can't be met because, for instance,
     // a type contains a std::string or some other type which can't be
     // held safely by value in Rust.
-    let byvalue_checker = ByValueChecker::new_from_apis(&apis, type_config)?;
+    let byvalue_checker = ByValueChecker::new_from_apis(&apis, config)?;
     let mut extra_apis = Vec::new();
-    let mut results: Vec<_> = apis
-        .into_iter()
-        .map(|api| analyze_pod_api(api, &byvalue_checker, type_converter, &mut extra_apis))
-        .collect::<Result<Vec<_>, ConvertError>>()?;
+    let mut type_converter = TypeConverter::new(config, &apis);
+    let mut results = Vec::new();
+    convert_apis(
+        apis,
+        &mut results,
+        Api::fun_unchanged,
+        |name, item, _| {
+            analyze_struct(
+                &byvalue_checker,
+                &mut type_converter,
+                &mut extra_apis,
+                name,
+                item,
+            )
+        },
+        analyze_enum,
+        Api::typedef_unchanged,
+    );
     // Conceivably, the process of POD-analysing the first set of APIs could result
     // in us creating new APIs to concretize generic types.
+    let extra_apis: Vec<Api<PodAnalysis>> = extra_apis.into_iter().map(add_analysis).collect();
     let mut more_extra_apis = Vec::new();
-    let mut more_results = extra_apis
-        .into_iter()
-        .map(|api| analyze_pod_api(api, &byvalue_checker, type_converter, &mut more_extra_apis))
-        .collect::<Result<Vec<_>, ConvertError>>()?;
+    convert_apis(
+        extra_apis,
+        &mut results,
+        Api::fun_unchanged,
+        |name, item, _| {
+            analyze_struct(
+                &byvalue_checker,
+                &mut type_converter,
+                &mut more_extra_apis,
+                name,
+                item,
+            )
+        },
+        analyze_enum,
+        Api::typedef_unchanged,
+    );
     assert!(more_extra_apis.is_empty());
-    results.append(&mut more_results);
     Ok(results)
 }
 
-fn analyze_pod_api(
-    api: UnanalyzedApi,
+fn analyze_enum(
+    name: ApiName,
+    mut item: ItemEnum,
+) -> Result<Option<Api<PodAnalysis>>, ConvertErrorWithContext> {
+    super::remove_bindgen_attrs(&mut item.attrs, name.name.get_final_ident())?;
+    Ok(Some(Api::Enum { name, item }))
+}
+
+fn analyze_struct(
     byvalue_checker: &ByValueChecker,
     type_converter: &mut TypeConverter,
     extra_apis: &mut Vec<UnanalyzedApi>,
-) -> Result<Api<PodAnalysis>, ConvertError> {
-    let ty_id = api.typename();
-    let mut new_deps = api.deps;
-    let api_detail = match api.detail {
-        // No changes to any of these...
-        ApiDetail::ConcreteType { rs_definition } => ApiDetail::ConcreteType { rs_definition },
-        ApiDetail::StringConstructor => ApiDetail::StringConstructor,
-        ApiDetail::Function { fun, analysis } => ApiDetail::Function { fun, analysis },
-        ApiDetail::Const { const_item } => ApiDetail::Const { const_item },
-        ApiDetail::Typedef { payload } => ApiDetail::Typedef { payload },
-        ApiDetail::CType { typename } => ApiDetail::CType { typename },
-        // Just changes to this one...
-        ApiDetail::Type {
-            is_forward_declaration,
-            mut bindgen_mod_item,
-            analysis: _,
-        } => {
-            let type_kind = if is_forward_declaration {
-                TypeKind::ForwardDeclaration
-            } else if byvalue_checker.is_pod(&ty_id) {
-                // It's POD so let's mark dependencies on things in its field
-                if let Some(Item::Struct(ref s)) = bindgen_mod_item {
-                    get_struct_field_types(
-                        type_converter,
-                        &api.name.get_namespace(),
-                        &s,
-                        &mut new_deps,
-                        extra_apis,
-                    )?;
-                } // otherwise might be an enum, etc.
-                TypeKind::Pod
-            } else {
-                // It's non-POD. So also, make the fields opaque...
-                if let Some(Item::Struct(ref mut s)) = bindgen_mod_item {
-                    make_non_pod(s);
-                } // otherwise might be an enum, etc.
-                  // ... and say we don't depend on other types.
-                new_deps.clear();
-                TypeKind::NonPod
-            };
-            ApiDetail::Type {
-                is_forward_declaration,
-                bindgen_mod_item,
-                analysis: type_kind,
-            }
-        }
-        ApiDetail::OpaqueTypedef => ApiDetail::OpaqueTypedef,
-        ApiDetail::IgnoredItem { err, ctx } => ApiDetail::IgnoredItem { err, ctx },
+    name: ApiName,
+    mut item: ItemStruct,
+) -> Result<Option<Api<PodAnalysis>>, ConvertErrorWithContext> {
+    let id = name.name.get_final_ident();
+    super::remove_bindgen_attrs(&mut item.attrs, id.clone())?;
+    let bases = get_bases(&item);
+    let mut field_deps = HashSet::new();
+    let type_kind = if byvalue_checker.is_pod(&name.name) {
+        // It's POD so let's mark dependencies on things in its field
+        get_struct_field_types(
+            type_converter,
+            &name.name.get_namespace(),
+            &item,
+            &mut field_deps,
+            extra_apis,
+        )
+        .map_err(|e| ConvertErrorWithContext(e, Some(ErrorContext::Item(id))))?;
+        TypeKind::Pod
+    } else {
+        // It's non-POD. So also, make the fields opaque...
+        make_non_pod(&mut item);
+        // ... and say we don't depend on other types.
+        TypeKind::NonPod
     };
-    Ok(Api {
-        name: api.name,
-        deps: new_deps,
-        detail: api_detail,
-    })
+    Ok(Some(Api::Struct {
+        name,
+        item,
+        analysis: PodStructAnalysisBody {
+            kind: type_kind,
+            bases,
+            field_deps,
+        },
+    }))
 }
 
 fn get_struct_field_types(
@@ -138,9 +160,24 @@ fn get_struct_field_types(
     extra_apis: &mut Vec<UnanalyzedApi>,
 ) -> Result<(), ConvertError> {
     for f in &s.fields {
-        let annotated = type_converter.convert_type(f.ty.clone(), ns, false)?;
+        let annotated =
+            type_converter.convert_type(f.ty.clone(), ns, &TypeConversionContext::CxxInnerType)?;
         extra_apis.extend(annotated.extra_apis);
         deps.extend(annotated.types_encountered);
     }
     Ok(())
+}
+
+fn get_bases(item: &ItemStruct) -> HashSet<QualifiedName> {
+    item.fields
+        .iter()
+        .filter_map(|f| match &f.ty {
+            Type::Path(typ) => f
+                .ident
+                .as_ref()
+                .filter(|id| id.to_string().starts_with("_base"))
+                .map(|_| QualifiedName::from_type_path(&typ)),
+            _ => None,
+        })
+        .collect()
 }

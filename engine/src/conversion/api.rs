@@ -12,25 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::types::QualifiedName;
-use std::collections::HashSet;
-use syn::{ForeignItemFn, Ident, ImplItem, Item, ItemConst, ItemType, ItemUse, Type};
+use crate::types::{Namespace, QualifiedName};
+use syn::{
+    ForeignItemFn, Ident, ImplItem, ItemConst, ItemEnum, ItemStruct, ItemType, ItemUse, Type,
+};
 
-use super::{convert_error::ErrorContext, parse::type_converter::TypeConverter, ConvertError};
+use super::{
+    convert_error::{ConvertErrorWithContext, ErrorContext},
+    ConvertError,
+};
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub(crate) enum TypeKind {
-    Pod,                // trivial. Can be moved and copied in Rust.
+    Pod,    // trivial. Can be moved and copied in Rust.
     NonPod, // has destructor or non-trivial move constructors. Can only hold by UniquePtr
-    ForwardDeclaration, // no full C++ declaration available - can't even generate UniquePtr
-    Abstract, // has pure virtual members - can't even generate UniquePtr
+    Abstract, // has pure virtual members - can't even generate UniquePtr.
+            // It's possible that the type itself isn't pure virtual, but it inherits from
+            // some other type which is pure virtual. Alternatively, maybe we just don't
+            // know if the base class is pure virtual because it wasn't on the allowlist,
+            // in which case we'll err on the side of caution.
 }
 
 impl TypeKind {
     pub(crate) fn can_be_instantiated(&self) -> bool {
         match self {
             TypeKind::Pod | TypeKind::NonPod => true,
-            TypeKind::ForwardDeclaration | TypeKind::Abstract => false,
+            TypeKind::Abstract => false,
         }
     }
 }
@@ -51,102 +58,213 @@ pub(crate) struct FuncToConvert {
 
 /// Layers of analysis which may be applied to decorate each API.
 /// See description of the purpose of this trait within `Api`.
-pub(crate) trait ApiAnalysis {
-    type TypeAnalysis;
+pub(crate) trait AnalysisPhase {
+    type TypedefAnalysis;
+    type StructAnalysis;
     type FunAnalysis;
 }
 
 /// No analysis has been applied to this API.
 pub(crate) struct NullAnalysis;
 
-impl ApiAnalysis for NullAnalysis {
-    type TypeAnalysis = ();
+impl AnalysisPhase for NullAnalysis {
+    type TypedefAnalysis = ();
+    type StructAnalysis = ();
     type FunAnalysis = ();
 }
 
+#[derive(Clone)]
 pub(crate) enum TypedefKind {
-    Type(ItemType),
     Use(ItemUse),
+    Type(ItemType),
 }
 
+/// Name information for an API. This includes the name by
+/// which we know it in Rust, and its C++ name, which may differ.
+pub(crate) struct ApiName {
+    pub(crate) name: QualifiedName,
+    pub(crate) cpp_name: Option<String>,
+}
+
+impl ApiName {
+    pub(crate) fn new(ns: &Namespace, id: Ident) -> Self {
+        Self {
+            name: QualifiedName::new(ns, id),
+            cpp_name: None,
+        }
+    }
+
+    pub(crate) fn new_in_root_namespace(id: Ident) -> Self {
+        Self::new(&Namespace::new(), id)
+    }
+}
+
+#[derive(strum_macros::Display)]
 /// Different types of API we might encounter.
-pub(crate) enum ApiDetail<T: ApiAnalysis> {
+///
+/// This type is parameterized over an `ApiAnalysis`. This is any additional
+/// information which we wish to apply to our knowledge of our APIs later
+/// during analysis phases.
+///
+/// This is not as high-level as the equivalent types in `cxx` or `bindgen`,
+/// because sometimes we pass on the `bindgen` output directly in the
+/// Rust codegen output.
+///
+/// This derives from [strum_macros::Display] because we want to be
+/// able to debug-print the enum discriminant without worrying about
+/// the fact that their payloads may not be `Debug` or `Display`.
+/// (Specifically, allowing `syn` Types to be `Debug` requires
+/// enabling syn's `extra-traits` feature which increases compile time.)
+pub(crate) enum Api<T: AnalysisPhase> {
+    /// A forward declared type for which no definition is available.
+    ForwardDeclaration { name: ApiName },
     /// A synthetic type we've manufactured in order to
     /// concretize some templated C++ type.
-    ConcreteType { rs_definition: Box<Type> },
+    ConcreteType {
+        name: ApiName,
+        rs_definition: Box<Type>,
+        cpp_definition: String,
+    },
     /// A simple note that we want to make a constructor for
     /// a `std::string` on the heap.
-    StringConstructor,
+    StringConstructor { name: ApiName },
     /// A function. May include some analysis.
     Function {
-        fun: FuncToConvert,
+        name: ApiName,
+        fun: Box<FuncToConvert>,
         analysis: T::FunAnalysis,
     },
     /// A constant.
-    Const { const_item: ItemConst },
+    Const {
+        name: ApiName,
+        const_item: ItemConst,
+    },
     /// A typedef found in the bindgen output which we wish
     /// to pass on in our output
-    Typedef { payload: TypedefKind },
-    /// A type (struct or enum) encountered in the
+    Typedef {
+        name: ApiName,
+        item: TypedefKind,
+        old_tyname: Option<QualifiedName>,
+        analysis: T::TypedefAnalysis,
+    },
+    /// An enum encountered in the
     /// `bindgen` output.
-    Type {
-        is_forward_declaration: bool,
-        bindgen_mod_item: Option<Item>,
-        analysis: T::TypeAnalysis,
+    Enum { name: ApiName, item: ItemEnum },
+    /// A struct encountered in the
+    /// `bindgen` output.
+    Struct {
+        name: ApiName,
+        item: ItemStruct,
+        analysis: T::StructAnalysis,
     },
     /// A variable-length C integer type (e.g. int, unsigned long).
-    CType { typename: QualifiedName },
-    /// A typedef which doesn't point to any actual useful kind of
-    /// type, but instead to something which `bindgen` couldn't figure out
-    /// and has therefore itself made opaque and mysterious.
-    OpaqueTypedef,
+    CType {
+        name: ApiName,
+        typename: QualifiedName,
+    },
     /// Some item which couldn't be processed by autocxx for some reason.
     /// We will have emitted a warning message about this, but we want
     /// to mark that it's ignored so that we don't attempt to process
     /// dependent items.
     IgnoredItem {
+        name: ApiName,
         err: ConvertError,
         ctx: ErrorContext,
     },
 }
 
-/// Any API we encounter in the input bindgen rs which we might want to pass
-/// onto the output Rust or C++.
-///
-/// This type is parameterized over an `ApiAnalysis`. This is any additional
-/// information which we wish to apply to our knowledge of our APIs later
-/// during analysis phases. It might be a excessively traity to parameterize
-/// this type; we might be better off relying on an `Option<SomeKindOfAnalysis>`
-/// but for now it's working.
-///
-/// This is not as high-level as the equivalent types in `cxx` or `bindgen`,
-/// because sometimes we pass on the `bindgen` output directly in the
-/// Rust codegen output.
-pub(crate) struct Api<T: ApiAnalysis> {
-    pub(crate) name: QualifiedName,
-    /// Any dependencies of this API, such that during garbage collection
-    /// we can ensure to keep them.
-    pub(crate) deps: HashSet<QualifiedName>,
-    /// Details of this specific API kind.
-    pub(crate) detail: ApiDetail<T>,
+impl<T: AnalysisPhase> Api<T> {
+    fn name_info(&self) -> &ApiName {
+        match self {
+            Api::ForwardDeclaration { name } => name,
+            Api::ConcreteType { name, .. } => name,
+            Api::StringConstructor { name } => name,
+            Api::Function { name, .. } => name,
+            Api::Const { name, .. } => name,
+            Api::Typedef { name, .. } => name,
+            Api::Enum { name, .. } => name,
+            Api::Struct { name, .. } => name,
+            Api::CType { name, .. } => name,
+            Api::IgnoredItem { name, .. } => name,
+        }
+    }
+
+    /// The name of this API as used in Rust code.
+    /// For types, it's important that this never changes, since
+    /// functions or other types may refer to this.
+    /// Yet for functions, this may not actually be the name
+    /// used in the [cxx::bridge] mod -  see
+    /// [Api<FnAnalysis>::cxxbridge_name]
+    pub(crate) fn name(&self) -> &QualifiedName {
+        &self.name_info().name
+    }
+
+    /// The name recorded for use in C++, if and only if
+    /// it differs from Rust.
+    pub(crate) fn cpp_name(&self) -> &Option<String> {
+        &self.name_info().cpp_name
+    }
+
+    /// The name for use in C++, whether or not it differs
+    /// from Rust.
+    pub(crate) fn effective_cpp_name(&self) -> &str {
+        self.cpp_name()
+            .as_deref()
+            .unwrap_or_else(|| self.name().get_final_item())
+    }
+}
+
+impl<T: AnalysisPhase> std::fmt::Debug for Api<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (kind={})", self.name().to_cpp_name(), self,)
+    }
 }
 
 pub(crate) type UnanalyzedApi = Api<NullAnalysis>;
 
-impl<T: ApiAnalysis> Api<T> {
-    pub(crate) fn typename(&self) -> QualifiedName {
-        self.name.clone()
+impl<T: AnalysisPhase> Api<T> {
+    pub(crate) fn typedef_unchanged(
+        name: ApiName,
+        item: TypedefKind,
+        old_tyname: Option<QualifiedName>,
+        analysis: T::TypedefAnalysis,
+    ) -> Result<Option<Api<T>>, ConvertErrorWithContext> {
+        Ok(Some(Api::Typedef {
+            name,
+            item,
+            old_tyname,
+            analysis,
+        }))
     }
-}
 
-/// Results of parsing the bindgen mod. This is what is passed from
-/// the parser to the analysis phases.
-pub(crate) struct ParseResults {
-    /// All APIs encountered. This is the main thing.
-    pub(crate) apis: Vec<UnanalyzedApi>,
-    /// A database containing known relationships between types.
-    /// In particular, any typedefs detected.
-    /// This should probably be replaced by extracting this information
-    /// from APIs as necessary later. TODO
-    pub(crate) type_converter: TypeConverter,
+    pub(crate) fn struct_unchanged(
+        name: ApiName,
+        item: ItemStruct,
+        analysis: T::StructAnalysis,
+    ) -> Result<Option<Api<T>>, ConvertErrorWithContext> {
+        Ok(Some(Api::Struct {
+            name,
+            item,
+            analysis,
+        }))
+    }
+
+    pub(crate) fn fun_unchanged(
+        name: ApiName,
+        fun: Box<FuncToConvert>,
+        analysis: T::FunAnalysis,
+    ) -> Result<Option<Api<T>>, ConvertErrorWithContext> {
+        Ok(Some(Api::Function {
+            name,
+            fun,
+            analysis,
+        }))
+    }
+
+    pub(crate) fn enum_unchanged(
+        name: ApiName,
+        item: ItemEnum,
+    ) -> Result<Option<Api<T>>, ConvertErrorWithContext> {
+        Ok(Some(Api::Enum { name, item }))
+    }
 }

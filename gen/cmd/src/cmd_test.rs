@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{convert::TryInto, fs::File, io::Write, path::PathBuf};
+use std::{convert::TryInto, fs::File, io::Write, path::Path};
 
 use assert_cmd::Command;
 use tempdir::TempDir;
@@ -27,15 +27,17 @@ fn test_help() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn test_gen() -> Result<(), Box<dyn std::error::Error>> {
-    let tmp_dir = TempDir::new("example")?;
+fn base_test<F>(tmp_dir: &TempDir, arg_modifier: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnOnce(&mut Command),
+{
     let demo_code_dir = tmp_dir.path().join("demo");
     std::fs::create_dir(&demo_code_dir).unwrap();
     write_to_file(&demo_code_dir, "input.h", INPUT_H.as_bytes());
     write_to_file(&demo_code_dir, "main.rs", MAIN_RS.as_bytes());
     let demo_rs = demo_code_dir.join("main.rs");
     let mut cmd = Command::cargo_bin("autocxx-gen")?;
+    arg_modifier(&mut cmd);
     cmd.arg("--inc")
         .arg(demo_code_dir.to_str().unwrap())
         .arg(demo_rs)
@@ -50,28 +52,21 @@ fn test_gen() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_gen() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp_dir = TempDir::new("example")?;
+    base_test(&tmp_dir, |_| {})
+}
+
+#[test]
 fn test_gen_fixed_num() -> Result<(), Box<dyn std::error::Error>> {
     let tmp_dir = TempDir::new("example")?;
-    let demo_code_dir = tmp_dir.path().join("demo");
-    std::fs::create_dir(&demo_code_dir).unwrap();
-    write_to_file(&demo_code_dir, "input.h", INPUT_H.as_bytes());
-    write_to_file(&demo_code_dir, "main.rs", MAIN_RS.as_bytes());
-    let demo_rs = demo_code_dir.join("main.rs");
-    let mut cmd = Command::cargo_bin("autocxx-gen")?;
-    cmd.arg("-I")
-        .arg(demo_code_dir.to_str().unwrap())
-        .arg(demo_rs)
-        .arg("--outdir")
-        .arg(tmp_dir.path().to_str().unwrap())
-        .arg("--gen-cpp")
-        .arg("--gen-rs-include")
-        .arg("--generate-exact")
-        .arg("3")
-        .arg("--fix-rs-include-name")
-        .assert()
-        .success();
+    base_test(&tmp_dir, |cmd| {
+        cmd.arg("--generate-exact")
+            .arg("3")
+            .arg("--fix-rs-include-name");
+    })?;
     assert_contentful(&tmp_dir, "gen0.cc");
-    assert_contentful(&tmp_dir, "gen1.cc");
+    assert_exists(&tmp_dir, "gen1.cc");
     assert_exists(&tmp_dir, "gen2.cc");
     assert_contentful(&tmp_dir, "gen0.include.rs");
     assert_exists(&tmp_dir, "gen1.include.rs");
@@ -79,7 +74,21 @@ fn test_gen_fixed_num() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn write_to_file(dir: &PathBuf, filename: &str, content: &[u8]) {
+#[test]
+fn test_gen_preprocess() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp_dir = TempDir::new("example")?;
+    let prepro_path = tmp_dir.path().join("preprocessed.h");
+    base_test(&tmp_dir, |cmd| {
+        cmd.env("AUTOCXX_PREPROCESS", prepro_path.to_str().unwrap());
+    })?;
+    assert_contentful(&tmp_dir, "preprocessed.h");
+    // Check that a random thing from one of the headers in
+    // `ALL_KNOWN_SYSTEM_HEADERS` is included.
+    assert!(std::fs::read_to_string(prepro_path)?.contains("integer_sequence"));
+    Ok(())
+}
+
+fn write_to_file(dir: &Path, filename: &str, content: &[u8]) {
     let path = dir.join(filename);
     let mut f = File::create(&path).expect("Unable to create file");
     f.write_all(content).expect("Unable to write file");

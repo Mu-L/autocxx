@@ -17,6 +17,7 @@
 // limitations under the License.
 
 mod conversion;
+mod cxxbridge;
 mod known_types;
 mod parse_callbacks;
 mod parse_file;
@@ -30,8 +31,9 @@ mod builder;
 mod integration_tests;
 
 use autocxx_parser::{IncludeCppConfig, UnsafePolicy};
-use conversion::{BridgeConverter, CppCodegenResults};
+use conversion::BridgeConverter;
 use parse_callbacks::AutocxxParseCallbacks;
+use parse_file::CppBuildable;
 use proc_macro2::TokenStream as TokenStream2;
 use std::{
     collections::hash_map::DefaultHasher,
@@ -39,7 +41,12 @@ use std::{
     hash::{Hash, Hasher},
     path::PathBuf,
 };
-use std::{fs::File, io::prelude::*, path::Path, process::Command};
+use std::{
+    fs::File,
+    io::prelude::*,
+    path::Path,
+    process::{Command, Stdio},
+};
 use tempfile::NamedTempFile;
 
 use quote::ToTokens;
@@ -49,7 +56,7 @@ use syn::{
     parse_quote, ItemMod, Macro,
 };
 
-use itertools::join;
+use itertools::{join, Itertools};
 use known_types::known_types;
 use log::info;
 
@@ -70,12 +77,13 @@ pub use cxx_gen::HEADER;
 /// <https://github.com/google/autocxx/issues/36>
 pub use cxx;
 
+#[derive(Clone)]
 /// Some C++ content which should be written to disk and built.
 pub struct CppFilePair {
     /// Declarations to go into a header file.
     pub header: Vec<u8>,
-    /// Implementations to go into a .cpp file.
-    pub implementation: Vec<u8>,
+    /// Implementations to go into a .cpp file, if any.
+    pub implementation: Option<Vec<u8>>,
     /// The name which should be used for the header file
     /// (important as it may be `#include`d elsewhere)
     pub header_name: String,
@@ -98,12 +106,6 @@ pub enum Error {
     /// Some error occcurred in converting the bindgen-style
     /// bindings to safe cxx bindings.
     Conversion(conversion::ConvertError),
-    /// No 'generate' or 'generate_pod' was specified.
-    /// It might be that in future we can simply let things work
-    /// without any allowlist, in which case bindgen should generate
-    /// bindings for everything. That just seems very unlikely to work
-    /// in the common case right now.
-    NoGenerationRequested,
 }
 
 impl Display for Error {
@@ -113,7 +115,6 @@ impl Display for Error {
             Error::Parsing(err) => write!(f, "The Rust file could not be parsede: {}", err)?,
             Error::NoAutoCxxInc => write!(f, "No C++ include directory was provided.")?,
             Error::Conversion(err) => write!(f, "autocxx could not generate the requested bindings. {}", err)?,
-            Error::NoGenerationRequested => write!(f, "No 'generate' or 'generate_pod' directives were found, so we would not generate any Rust bindings despite the inclusion of C++ headers.")?,
         }
         Ok(())
     }
@@ -124,7 +125,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 struct GenerationResults {
     item_mod: ItemMod,
-    additional_cpp_generator: Option<CppCodegenResults>,
+    cpp: Option<CppFilePair>,
     inc_dirs: Vec<PathBuf>,
 }
 enum State {
@@ -216,19 +217,17 @@ pub trait RebuildDependencyRecorder: std::fmt::Debug {
 ///     syn[(syn parse)]
 ///     apis(Unanalyzed APIs)
 ///     subgraph parse
-///     tc(TypeConverter)
 ///     syn ==> parse_bindgen
 ///     end
 ///     parse_bindgen ==> apis
-///     parse_bindgen -.-> tc
 ///     subgraph analysis
+///     typedef[typedef analysis]
 ///     pod[POD analysis]
-///     tc -.-> pod
-///     apis ==> pod
+///     apis ==> typedef
+///     typedef ==> pod
 ///     podapis(APIs with POD analysis)
 ///     pod ==> podapis
 ///     fun[Function materialization analysis]
-///     tc -.-> fun
 ///     podapis ==> fun
 ///     funapis(APIs with function analysis)
 ///     fun ==> funapis
@@ -291,20 +290,30 @@ impl IncludeCppEngine {
             .enable_cxx_namespaces()
             .generate_inline_functions(true)
             .layout_tests(false); // TODO revisit later
-        for item in known_types::get_initial_blocklist() {
+        for item in known_types().get_initial_blocklist() {
             builder = builder.blocklist_item(item);
         }
 
         // 3. Passes allowlist and other options to the bindgen::Builder equivalent
         //    to --output-style=cxx --allowlist=<as passed in>
-        for a in self.config.type_config.allowlist() {
-            // TODO - allowlist type/functions/separately
-            builder = builder
-                .allowlist_type(a)
-                .allowlist_function(a)
-                .allowlist_var(a);
+        if let Some(allowlist) = self.config.bindgen_allowlist() {
+            for a in allowlist {
+                // TODO - allowlist type/functions/separately
+                builder = builder
+                    .allowlist_type(&a)
+                    .allowlist_function(&a)
+                    .allowlist_var(&a);
+            }
         }
 
+        log::info!(
+            "Bindgen flags would be: {}",
+            builder
+                .command_line_flags()
+                .into_iter()
+                .map(|f| format!("\"{}\"", f))
+                .join(" ")
+        );
         builder
     }
 
@@ -322,6 +331,12 @@ impl IncludeCppEngine {
             State::Generated(gen_results) => gen_results.item_mod.to_token_stream(),
             State::ParseOnly => TokenStream2::new(),
         }
+    }
+
+    /// Returns the name of the mod which this `include_cpp!` will generate.
+    /// Can and should be used to ensure multiple mods in a file don't conflict.
+    pub fn get_mod_name(&self) -> String {
+        self.config.get_mod_name().to_string()
     }
 
     fn parse_bindings(&self, bindings: bindgen::Bindings) -> Result<ItemMod> {
@@ -356,10 +371,7 @@ impl IncludeCppEngine {
             State::Generated(_) => panic!("Only call generate once"),
         }
 
-        if self.config.type_config.allowlist_is_empty() {
-            return Err(Error::NoGenerationRequested);
-        }
-
+        let mod_name = self.config.get_mod_name();
         let mut builder = self.make_bindgen_builder(&inc_dirs, &extra_clang_args);
         if let Some(dep_recorder) = dep_recorder {
             builder = builder.parse_callbacks(Box::new(AutocxxParseCallbacks(dep_recorder)));
@@ -372,15 +384,10 @@ impl IncludeCppEngine {
         let bindings = builder.generate().map_err(Error::Bindgen)?;
         let bindings = self.parse_bindings(bindings)?;
 
-        let converter = BridgeConverter::new(&self.config.inclusions, &self.config.type_config);
+        let converter = BridgeConverter::new(&self.config.inclusions, &self.config);
 
         let conversion = converter
-            .convert(
-                bindings,
-                self.config.exclude_utilities,
-                self.config.unsafe_policy.clone(),
-                header_contents,
-            )
+            .convert(bindings, self.config.unsafe_policy.clone(), header_contents)
             .map_err(Error::Conversion)?;
         let mut items = conversion.rs;
         let mut new_bindings: ItemMod = parse_quote! {
@@ -388,7 +395,7 @@ impl IncludeCppEngine {
             #[allow(dead_code)]
             #[allow(non_upper_case_globals)]
             #[allow(non_camel_case_types)]
-            mod ffi {
+            mod #mod_name {
             }
         };
         new_bindings.content.as_mut().unwrap().1.append(&mut items);
@@ -398,51 +405,16 @@ impl IncludeCppEngine {
         );
         self.state = State::Generated(Box::new(GenerationResults {
             item_mod: new_bindings,
-            additional_cpp_generator: conversion.cpp,
+            cpp: conversion.cpp,
             inc_dirs,
         }));
         Ok(())
     }
 
-    /// Generate C++-side bindings for these APIs. Call `generate` first.
-    pub fn generate_h_and_cxx(&self) -> Result<GeneratedCpp, cxx_gen::Error> {
-        let mut files = Vec::new();
-        match &self.state {
-            State::ParseOnly => panic!("Cannot generate C++ in parse-only mode"),
-            State::NotGenerated => panic!("Call generate() first"),
-            State::Generated(gen_results) => {
-                let rs = gen_results.item_mod.to_token_stream();
-                let opt = cxx_gen::Opt::default();
-                let cxx_generated = cxx_gen::generate_header_and_cc(rs, &opt)?;
-                files.push(CppFilePair {
-                    header: cxx_generated.header,
-                    header_name: "cxxgen.h".to_string(),
-                    implementation: cxx_generated.implementation,
-                });
-
-                match gen_results.additional_cpp_generator {
-                    None => {}
-                    Some(ref additional_cpp) => {
-                        // TODO should probably replace pragma once below with traditional include guards.
-                        let declarations = format!("#pragma once\n{}", additional_cpp.declarations);
-                        files.push(CppFilePair {
-                            header: declarations.as_bytes().to_vec(),
-                            header_name: "autocxxgen.h".to_string(),
-                            implementation: additional_cpp.definitions.as_bytes().to_vec(),
-                        });
-                        info!("Additional C++ decls:\n{}", declarations);
-                        info!("Additional C++ defs:\n{}", additional_cpp.definitions);
-                    }
-                }
-            }
-        };
-        Ok(GeneratedCpp(files))
-    }
-
     /// Return the include directories used for this include_cpp invocation.
-    pub fn include_dirs(&self) -> &Vec<PathBuf> {
+    fn include_dirs(&self) -> impl Iterator<Item = &PathBuf> {
         match &self.state {
-            State::Generated(gen_results) => &gen_results.inc_dirs,
+            State::Generated(gen_results) => gen_results.inc_dirs.iter(),
             _ => panic!("Must call generate() before include_dirs()"),
         }
     }
@@ -454,7 +426,19 @@ impl IncludeCppEngine {
         extra_clang_args: &[&str],
     ) {
         if let Ok(output_path) = std::env::var("AUTOCXX_PREPROCESS") {
-            let input = format!("/*\nautocxx config:\n\n{:?}\n\nend autocxx config.\nautocxx preprocessed input:\n*/\n\n{}", self.config, header);
+            // Include a load of system headers at the end of the preprocessed output,
+            // because we would like to be able to generate bindings from the
+            // preprocessed header, and then build those bindings. The C++ parts
+            // of those bindings might need things inside these various headers;
+            // we make sure all these definitions and declarations are inside
+            // this one header file so that the reduction process does not have
+            // to refer to local headers on the reduction machine too.
+            let suffix = ALL_KNOWN_SYSTEM_HEADERS
+                .iter()
+                .map(|hdr| format!("#include <{}>\n", hdr))
+                .join("\n");
+            let input = format!("/*\nautocxx config:\n\n{:?}\n\nend autocxx config.\nautocxx preprocessed input:\n*/\n\n{}\n\n/* autocxx: extra headers added below for completeness. */\n\n{}\n{}\n",
+                self.config, header, suffix, cxx_gen::HEADER);
             let mut tf = NamedTempFile::new().unwrap();
             write!(tf, "{}", input).unwrap();
             let tp = tf.into_temp_path();
@@ -463,7 +447,66 @@ impl IncludeCppEngine {
     }
 }
 
-fn make_clang_args<'a>(
+/// This is a list of all the headers known to be included in generated
+/// C++ by cxx. We only use this when `AUTOCXX_PERPROCESS` is set to true,
+/// in an attempt to make the resulting preprocessed header more hermetic.
+/// We clearly should _not_ use this in any other circumstance; obviously
+/// we'd then want to add an API to cxx_gen such that we could retrieve
+/// that information from source.
+static ALL_KNOWN_SYSTEM_HEADERS: &[&str] = &[
+    "memory",
+    "string",
+    "algorithm",
+    "array",
+    "cassert",
+    "cstddef",
+    "cstdint",
+    "cstring",
+    "exception",
+    "functional",
+    "initializer_list",
+    "iterator",
+    "memory",
+    "new",
+    "stdexcept",
+    "type_traits",
+    "utility",
+    "vector",
+    "sys/types.h",
+];
+
+pub fn do_cxx_cpp_generation(rs: TokenStream2) -> Result<CppFilePair, cxx_gen::Error> {
+    let opt = cxx_gen::Opt::default();
+    let cxx_generated = cxx_gen::generate_header_and_cc(rs, &opt)?;
+    Ok(CppFilePair {
+        header: cxx_generated.header,
+        header_name: "cxxgen.h".into(),
+        implementation: Some(cxx_generated.implementation),
+    })
+}
+
+impl CppBuildable for IncludeCppEngine {
+    /// Generate C++-side bindings for these APIs. Call `generate` first.
+    fn generate_h_and_cxx(&self) -> Result<GeneratedCpp, cxx_gen::Error> {
+        let mut files = Vec::new();
+        match &self.state {
+            State::ParseOnly => panic!("Cannot generate C++ in parse-only mode"),
+            State::NotGenerated => panic!("Call generate() first"),
+            State::Generated(gen_results) => {
+                let rs = gen_results.item_mod.to_token_stream();
+                files.push(do_cxx_cpp_generation(rs)?);
+                if let Some(cpp_file_pair) = &gen_results.cpp {
+                    files.push(cpp_file_pair.clone());
+                }
+            }
+        };
+        Ok(GeneratedCpp(files))
+    }
+}
+
+/// Get clang args as if we were operating clang the same way as we operate
+/// bindgen.
+pub fn make_clang_args<'a>(
     incs: &'a [PathBuf],
     extra_args: &'a [&str],
 ) -> impl Iterator<Item = String> + 'a {
@@ -484,13 +527,29 @@ pub fn preprocess(
     incs: &[PathBuf],
     extra_clang_args: &[&str],
 ) -> Result<(), std::io::Error> {
-    let mut cmd = Command::new("clang++");
+    let mut cmd = Command::new(get_clang_path());
     cmd.arg("-E");
     cmd.arg("-C");
     cmd.args(make_clang_args(incs, extra_clang_args));
     cmd.arg(listing_path.to_str().unwrap());
-    let output = cmd.output().expect("failed to preprocess").stdout;
+    cmd.stderr(Stdio::inherit());
+    let result = cmd.output().expect("failed to execute clang++");
+    if !result.status.success() {
+        panic!("failed to preprocess");
+    }
     let mut file = File::create(preprocess_path)?;
-    file.write_all(&output)?;
+    file.write_all(&result.stdout)?;
     Ok(())
+}
+
+/// Get the path to clang which is effective for any preprocessing
+/// operations done by autocxx.
+pub fn get_clang_path() -> String {
+    // `CLANG_PATH` is the environment variable that clang-sys uses to specify
+    // the path to Clang, so in most cases where someone is using a compiler
+    // that's not on the path, things should just work. We also check `CXX`,
+    // since some users may have set that.
+    std::env::var("CLANG_PATH")
+        .or_else(|_| std::env::var("CXX"))
+        .unwrap_or_else(|_| "clang++".to_string())
 }

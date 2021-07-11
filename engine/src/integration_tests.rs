@@ -18,6 +18,7 @@ use once_cell::sync::OnceCell;
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use quote::ToTokens;
+use quote::TokenStreamExt;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
@@ -124,7 +125,12 @@ fn run_test(
     .unwrap()
 }
 
+// A function applied to the resultant generated Rust code
+// which can be used to inspect that code.
+type RustCodeChecker = Box<dyn FnOnce(syn::File) -> Result<(), TestError>>;
+
 /// A positive test, we expect to pass.
+#[allow(clippy::too_many_arguments)] // least typing for each test
 fn run_test_ex(
     cxx_code: &str,
     header_code: &str,
@@ -133,9 +139,7 @@ fn run_test_ex(
     generate_pods: &[&str],
     extra_directives: Option<TokenStream>,
     extra_clang_args: &[&str],
-    // A function applied to the resultant generated Rust code
-    // which can be used to inspect that code.
-    rust_code_checker: Option<Box<dyn FnOnce(syn::File) -> Result<(), TestError>>>,
+    rust_code_checker: Option<RustCodeChecker>,
 ) {
     do_run_test(
         cxx_code,
@@ -183,6 +187,7 @@ enum TestError {
     RsCodeExaminationFail,
 }
 
+#[allow(clippy::too_many_arguments)] // least typing for each test
 fn do_run_test(
     cxx_code: &str,
     header_code: &str,
@@ -191,14 +196,9 @@ fn do_run_test(
     generate_pods: &[&str],
     extra_directives: Option<TokenStream>,
     extra_clang_args: &[&str],
-    rust_code_checker: Option<Box<dyn FnOnce(syn::File) -> Result<(), TestError>>>,
+    rust_code_checker: Option<RustCodeChecker>,
 ) -> Result<(), TestError> {
-    // Step 1: Write the C++ header snippet to a temp file
-    let tdir = tempdir().unwrap();
-    write_to_file(&tdir, "input.h", &format!("#pragma once\n{}", header_code));
-    write_to_file(&tdir, "cxx.h", crate::HEADER);
-
-    // Step 2: Expand the snippet of Rust code into an entire
+    // Step 1: Expand the snippet of Rust code into an entire
     //         program including include_cxx!
     let generate = generate.iter().map(|s| {
         quote! {
@@ -212,25 +212,58 @@ fn do_run_test(
     });
 
     let hexathorpe = Token![#](Span::call_site());
-    let unexpanded_rust = quote! {
-        use autocxx::include_cpp;
+    let unexpanded_rust = |hdr: &str| {
+        quote! {
+            use autocxx::include_cpp;
 
-        include_cpp!(
-            #hexathorpe include "input.h"
-            safety!(unsafe_ffi)
-            #(#generate)*
-            #(#generate_pods)*
-            #extra_directives
-        );
+            include_cpp!(
+                #hexathorpe include #hdr
+                safety!(unsafe_ffi)
+                #(#generate)*
+                #(#generate_pods)*
+                #extra_directives
+            );
 
-        fn main() {
-            #rust_code
+            fn main() {
+                #rust_code
+            }
         }
+    };
+    do_run_test_manual(
+        cxx_code,
+        header_code,
+        unexpanded_rust,
+        extra_clang_args,
+        rust_code_checker,
+    )
+}
 
+fn do_run_test_manual<F>(
+    cxx_code: &str,
+    header_code: &str,
+    rust_code_generator: F,
+    extra_clang_args: &[&str],
+    rust_code_checker: Option<RustCodeChecker>,
+) -> Result<(), TestError>
+where
+    F: FnOnce(&'static str) -> TokenStream,
+{
+    const HEADER_NAME: &str = "input.h";
+    let mut rust_code = rust_code_generator(HEADER_NAME);
+    // Step 2: Write the C++ header snippet to a temp file
+    let tdir = tempdir().unwrap();
+    write_to_file(
+        &tdir,
+        HEADER_NAME,
+        &format!("#pragma once\n{}", header_code),
+    );
+    write_to_file(&tdir, "cxx.h", crate::HEADER);
+
+    rust_code.append_all(quote! {
         #[link(name="autocxx-demo")]
         extern {}
-    };
-    info!("Unexpanded Rust: {}", unexpanded_rust);
+    });
+    info!("Unexpanded Rust: {}", rust_code);
 
     let write_rust_to_file = |ts: &TokenStream| -> PathBuf {
         // Step 3: Write the Rust code to a temp file
@@ -241,7 +274,7 @@ fn do_run_test(
     let target_dir = tdir.path().join("target");
     std::fs::create_dir(&target_dir).unwrap();
 
-    let rs_path = write_rust_to_file(&unexpanded_rust);
+    let rs_path = write_rust_to_file(&rust_code);
 
     info!("Path is {:?}", tdir.path());
     let build_results = crate::builder::build_to_custom_directory(
@@ -658,6 +691,79 @@ fn test_take_pod_by_value() {
         struct Bob {
             uint32_t a;
             uint32_t b;
+        };
+        uint32_t take_bob(Bob a);
+    "};
+    let rs = quote! {
+        let a = ffi::Bob { a: 12, b: 13 };
+        assert_eq!(ffi::take_bob(a), 12);
+    };
+    run_test(cxx, hdr, rs, &["take_bob"], &["Bob"]);
+}
+
+#[test]
+fn test_negative_take_as_pod_with_destructor() {
+    let cxx = indoc! {"
+        uint32_t take_bob(Bob a) {
+            return a.a;
+        }
+    "};
+    let hdr = indoc! {"
+        #include <cstdint>
+        struct Bob {
+            uint32_t a;
+            uint32_t b;
+            inline ~Bob() {}
+        };
+        uint32_t take_bob(Bob a);
+    "};
+    let rs = quote! {
+        let a = ffi::Bob { a: 12, b: 13 };
+        assert_eq!(ffi::take_bob(a), 12);
+    };
+    run_test_expect_fail(cxx, hdr, rs, &["take_bob"], &["Bob"]);
+}
+
+#[test]
+fn test_negative_take_as_pod_with_move_constructor() {
+    let cxx = indoc! {"
+        uint32_t take_bob(Bob a) {
+            return a.a;
+        }
+    "};
+    let hdr = indoc! {"
+        #include <cstdint>
+        #include <type_traits>
+        struct Bob {
+            uint32_t a;
+            uint32_t b;
+            inline Bob(Bob&& other_bob) {}
+        };
+        uint32_t take_bob(Bob a);
+    "};
+    let rs = quote! {
+        let a = ffi::Bob { a: 12, b: 13 };
+        assert_eq!(ffi::take_bob(a), 12);
+    };
+    run_test_expect_fail(cxx, hdr, rs, &["take_bob"], &["Bob"]);
+}
+
+#[test]
+fn test_take_as_pod_with_is_relocatable() {
+    let cxx = indoc! {"
+        uint32_t take_bob(Bob a) {
+            return a.a;
+        }
+    "};
+    let hdr = indoc! {"
+        #include <cstdint>
+        #include <type_traits>
+        struct Bob {
+            uint32_t a;
+            uint32_t b;
+            inline ~Bob() {}
+            inline Bob(Bob&& other_bob) { a = other_bob.a; b = other_bob.b; }
+            using IsRelocatable = std::true_type;
         };
         uint32_t take_bob(Bob a);
     "};
@@ -2808,6 +2914,19 @@ fn test_make_string() {
 }
 
 #[test]
+fn test_string_make_unique() {
+    let hdr = indoc! {"
+        #include <string>
+        inline void take_string(const std::string*) {};
+    "};
+    let rs = quote! {
+        let s = ffi::make_string("");
+        unsafe { ffi::take_string(s.as_ref().unwrap()) };
+    };
+    run_test("", hdr, rs, &["take_string"], &[]);
+}
+
+#[test]
 fn test_string_constant() {
     let hdr = indoc! {"
         #include <cstdint>
@@ -3554,14 +3673,31 @@ fn test_forward_declaration() {
         struct B {
             B() {}
             uint32_t a;
-            void daft(const A&) {}
-            void daft2(std::unique_ptr<A>) {}
+            void daft(const A&) const {}
+            void daft2(std::unique_ptr<A>) const {}
+            static B daft3(const A&) { B b; return b; }
         };
+        A* get_a();
+        void delete_a(A*);
+    "};
+    let cpp = indoc! {"
+        struct A {
+            uint32_t a;
+        };
+        A* get_a() {
+            return new A();
+        }
+        void delete_a(A* a) {
+            delete a;
+        }
     "};
     let rs = quote! {
-        ffi::B::make_unique();
+        let b = ffi::B::make_unique();
+        let a = ffi::get_a();
+        b.daft(unsafe { a.as_ref().unwrap() });
+        unsafe { ffi::delete_a(a) };
     };
-    run_test("", hdr, rs, &["B"], &[]);
+    run_test(cpp, hdr, rs, &["B", "get_a", "delete_a"], &[]);
 }
 
 #[test]
@@ -3651,28 +3787,53 @@ fn test_reserved_name() {
 
 #[test]
 fn test_nested_type() {
-    // For the time being, we merely test that a nested type doesn't conflict with a top-level type
-    // of the same name. We can't create an instance of `A::B` yet because autocxx gets confused
-    // when we try to generate it. Bindgen imports the type as `A_B`, autocxx inserts this
-    // type name into generated C++ code, and the C++ compiler then fails to recognize the type.
+    // Test that we can import APIs that use nested types.
+    // As a regression test, we also test that the nested type `A::B` doesn't conflict with the
+    // top-level type `B`. This used to cause compile errors.
     let hdr = indoc! {"
         struct A {
             A() {}
             struct B {
                 B() {}
             };
+            enum C {};
+            using D = int;
         };
         struct B {
             B() {}
             void method_on_top_level_type() const {}
         };
+        void take_A_B(A::B);
+        void take_A_C(A::C);
+        void take_A_D(A::D);
     "};
     let rs = quote! {
         let _ = ffi::A::make_unique();
         let b = ffi::B::make_unique();
         b.as_ref().unwrap().method_on_top_level_type();
     };
-    run_test("", hdr, rs, &["A", "B"], &[]);
+    run_test("", hdr, rs, &["A", "B", "take_A_B", "take_A_C"], &[]);
+}
+
+#[test]
+fn test_nested_type_in_namespace() {
+    // Test that we can import APIs that use nested types in a namespace.
+    // We can't make this part of the previous test as autocxx drops the
+    // namespace, so `A::B` and `N::A::B` would be imported as the same
+    // type.
+    let hdr = indoc! {"
+        namespace N {
+            struct A {
+                A() {}
+                struct B {
+                    B() {}
+                };
+            };
+        };
+        void take_A_B(N::A::B);
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["take_A_B"], &[]);
 }
 
 #[test]
@@ -3984,6 +4145,7 @@ fn test_issues_217_222() {
     let hdr = indoc! {"
     #include <string>
     #include <cstdint>
+    #include <cstddef>
 
     template <typename STRING_TYPE> class BasicStringPiece {
         public:
@@ -4067,13 +4229,13 @@ fn test_dependent_qualified_type() {
         size_t length;
     };
     const char* HELLO = \"hello\";
-    MyStringView<MyString> make_string_view() {
+    inline MyStringView<MyString> make_string_view() {
         MyStringView<MyString> r;
         r.start = HELLO;
         r.length = 2;
         return r;
     }
-    size_t take_string_view(const MyStringView<MyString>& bit) {
+    inline size_t take_string_view(const MyStringView<MyString>& bit) {
         return bit.length;
     }
     "};
@@ -4085,8 +4247,8 @@ fn test_dependent_qualified_type() {
 }
 
 #[test]
-#[ignore] // https://github.com/rust-lang/rust-bindgen/pull/1975, https://github.com/google/autocxx/issues/106
 fn test_simple_dependent_qualified_type() {
+    // bindgen seems to cope with this case just fine
     let hdr = indoc! {"
     #include <stddef.h>
     #include <stdint.h>
@@ -4099,10 +4261,10 @@ fn test_simple_dependent_qualified_type() {
         size_t length;
     };
     typedef MyStringView<MyString>::view_value_type MyChar;
-    MyChar make_char() {
+    inline MyChar make_char() {
         return 'a';
     }
-    uint32_t take_char(MyChar c) {
+    inline uint32_t take_char(MyChar c) {
         return static_cast<unsigned char>(c);
     }
     "};
@@ -4111,6 +4273,138 @@ fn test_simple_dependent_qualified_type() {
         assert_eq!(ffi::take_char(c), 97);
     };
     run_test("", hdr, rs, &["make_char", "take_char"], &[]);
+}
+
+#[test]
+fn test_ignore_dependent_qualified_type() {
+    let hdr = indoc! {"
+    #include <stddef.h>
+    struct MyString {
+        typedef char value_type;
+    };
+    template<typename T> struct MyStringView {
+        typedef typename T::value_type view_value_type;
+        const view_value_type* start;
+        size_t length;
+    };
+    MyStringView<MyString> make_string_view();
+    struct B {
+        B() {}
+        inline size_t take_string_view(const MyStringView<MyString> bit) {
+            return bit.length;
+        }
+    };
+    "};
+    let cpp = indoc! {"
+    const char* HELLO = \"hello\";
+    MyStringView<MyString> make_string_view() {
+        MyStringView<MyString> r;
+        r.start = HELLO;
+        r.length = 2;
+        return r;
+    }
+    "};
+    let rs = quote! {
+        ffi::B::make_unique();
+    };
+    run_test(cpp, hdr, rs, &["B"], &[]);
+}
+
+#[test]
+fn test_ignore_dependent_qualified_type_reference() {
+    let hdr = indoc! {"
+    #include <stddef.h>
+    struct MyString {
+        typedef char value_type;
+    };
+    template<typename T> struct MyStringView {
+        typedef typename T::value_type view_value_type;
+        const view_value_type* start;
+        size_t length;
+    };
+    MyStringView<MyString> make_string_view();
+    struct B {
+        B() {}
+        inline size_t take_string_view(const MyStringView<MyString>& bit) {
+            return bit.length;
+        }
+    };
+    "};
+    let cpp = indoc! {"
+    const char* HELLO = \"hello\";
+    MyStringView<MyString> make_string_view() {
+        MyStringView<MyString> r;
+        r.start = HELLO;
+        r.length = 2;
+        return r;
+    }
+    "};
+    let rs = quote! {
+        ffi::B::make_unique();
+    };
+    run_test(cpp, hdr, rs, &["B"], &[]);
+}
+
+#[test]
+fn test_specialization() {
+    let hdr = indoc! {"
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <string>
+    #include <type_traits>
+
+    template <typename T, bool = std::is_trivially_destructible<T>::value>
+    struct OptionalStorageBase {
+        T value_;
+    };
+
+    template <typename T,
+    bool = std::is_trivially_copy_constructible<T>::value,
+    bool = std::is_trivially_move_constructible<T>::value>
+    struct OptionalStorage : OptionalStorageBase<T> {};
+
+    template <typename T>
+    struct OptionalStorage<T,
+                       true /* trivially copy constructible */,
+                       false /* trivially move constructible */>
+    : OptionalStorageBase<T> {
+    };
+
+    template <typename T>
+    struct OptionalStorage<T,
+                       false /* trivially copy constructible */,
+                       true /* trivially move constructible */>
+    : OptionalStorageBase<T> {
+    };
+
+    template <typename T>
+    struct OptionalStorage<T,
+                       true /* trivially copy constructible */,
+                       true /* trivially move constructible */>
+    : OptionalStorageBase<T> {
+    };
+
+    template <typename T>
+    class OptionalBase {
+    private:
+        OptionalStorage<T> storage_;
+    };
+
+    template <typename T>
+    class Optional : public OptionalBase<T> {
+
+    };
+
+    struct B {
+        B() {}
+        void take_optional(Optional<std::string>) {}
+        uint32_t a;
+    };
+    "};
+    let rs = quote! {
+        ffi::B::make_unique();
+    };
+    run_test("", hdr, rs, &["B"], &[]);
 }
 
 #[test]
@@ -4167,6 +4461,85 @@ fn test_union_ignored() {
         assert_eq!(b.get_a(), 2);
     };
     run_test("", hdr, rs, &["B"], &[]);
+}
+
+#[test]
+fn test_double_underscores_ignored() {
+    let hdr = indoc! {"
+    #include <cstdint>
+    struct __FOO {
+        uint32_t a;
+    };
+    struct B {
+        B() :a(1) {}
+        uint32_t take_foo(__FOO a) const {
+            return 3;
+        }
+        void do__something() const { }
+        uint32_t get_a() const { return 2; }
+        uint32_t a;
+    };
+    "};
+    let rs = quote! {
+        let b = ffi::B::make_unique();
+        assert_eq!(b.get_a(), 2);
+    };
+    run_test("", hdr, rs, &["B"], &[]);
+}
+
+#[test]
+fn test_double_underscore_typedef_ignored() {
+    let hdr = indoc! {"
+    #include <cstdint>
+    typedef int __int32_t;
+    typedef __int32_t __darwin_pid_t;
+    typedef __darwin_pid_t pid_t;
+    struct B {
+        B() :a(1) {}
+        uint32_t take_foo(pid_t) const {
+            return 3;
+        }
+        uint32_t get_a() const { return 2; }
+        uint32_t a;
+    };
+    "};
+    let rs = quote! {
+        let b = ffi::B::make_unique();
+        assert_eq!(b.get_a(), 2);
+    };
+    run_test("", hdr, rs, &["B"], &[]);
+}
+
+#[test]
+fn test_double_underscores_fn_namespace() {
+    let hdr = indoc! {"
+    namespace __B {
+        inline void a() {}
+    };
+    "};
+    run_test_ex(
+        "",
+        hdr,
+        quote! {},
+        &[],
+        &[],
+        Some(quote! { generate_all!() }),
+        &[],
+        None,
+    );
+}
+
+#[test]
+fn test_typedef_to_ptr_is_marked_unsafe() {
+    let hdr = indoc! {"
+    struct _xlocalefoo; /* forward reference */
+    typedef struct _xlocalefoo * locale_tfoo;
+    extern \"C\" {
+        locale_tfoo duplocalefoo(locale_tfoo);
+    }
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["duplocalefoo"], &[]);
 }
 
 #[test]
@@ -4302,6 +4675,81 @@ fn test_get_pure_virtual() {
         assert_eq!(a_ref.get_val(), 3);
     };
     run_test("", hdr, rs, &["A", "get_a"], &[]);
+}
+
+#[test]
+fn test_abstract_class_no_make_unique() {
+    // We shouldn't generate a make_unique() for abstract classes.
+    // The test is successful if the bindings compile, i.e. if autocxx doesn't
+    // attempt to instantiate the class.
+    let hdr = indoc! {"
+        class A {
+        public:
+            A();
+            virtual void foo() const = 0;
+        };
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["A"], &[]);
+}
+
+#[test]
+fn test_derived_abstract_class_no_make_unique() {
+    let hdr = indoc! {"
+        class A {
+        public:
+            A();
+            virtual void foo() const = 0;
+        };
+
+        class B : public A {
+        public:
+            B();
+        };
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["A", "B"], &[]);
+}
+
+#[test]
+fn test_recursive_derived_abstract_class_no_make_unique() {
+    let hdr = indoc! {"
+        class A {
+        public:
+            A() {};
+            virtual void foo() const = 0;
+        };
+
+        class B : public A {
+        public:
+            B() {};
+        };
+
+        class C : public B {
+        public:
+            C() {};
+        };
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["A", "B", "C"], &[]);
+}
+
+#[test]
+fn test_derived_abstract_class_with_no_allowlisting_no_make_unique() {
+    let hdr = indoc! {"
+        class A {
+        public:
+            A();
+            virtual void foo() const = 0;
+        };
+
+        class B : public A {
+        public:
+            B();
+        };
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["B"], &[]);
 }
 
 #[test]
@@ -4486,6 +4934,193 @@ fn test_string_transparent_static_method() {
     run_test("", hdr, rs, &["A"], &[]);
 }
 
+#[test]
+#[ignore] // https://github.com/google/autocxx/issues/490
+fn test_issue_490() {
+    let hdr = indoc! {"
+        typedef int a;
+        typedef long unsigned size_t;
+        namespace std {
+        namespace {
+        using ::size_t;
+        template <class b, b c> struct g { static const b value = c; };
+        template <bool d> using e = g<bool, d>;
+        typedef e<true> true_type;
+        template <size_t, size_t> struct ag {};
+        template <class b> typename b ::h move();
+        template <class> class allocator;
+        template <class> class vector;
+        } // namespace
+        } // namespace std
+        void *operator new(size_t, void *);
+        namespace std {
+        namespace {
+        template <class> struct iterator;
+        template <class b, class> struct ay { using h = b *; };
+        template <class b> struct bj { b bk; };
+        template <class bm, class> class bn : bj<bm> {};
+        template <class b, class i = b> class unique_ptr {
+        typedef i bp;
+        typedef typename ay<b, bp>::h bh;
+        bn<bh, bp> bq;
+        
+        public:
+        unique_ptr();
+        unique_ptr(bh);
+        bh get() const;
+        bh release();
+        };
+        template <class = void> struct bt;
+        } // namespace
+        } // namespace std
+        typedef a bv;
+        namespace absl {
+        template <typename ce> class cj {
+        public:
+        using bh = ce *;
+        using iterator = bh;
+        };
+        namespace j {
+        template <class ce> struct cp {
+        using k = ce;
+        using cq = std::bt<>;
+        };
+        template <class ce> using cr = typename cp<ce>::k;
+        template <class ce> using cs = typename cp<ce>::cq;
+        template <class, class, class, class> class ct {
+        public:
+        class iterator {};
+        class cu {
+            cu(iterator);
+            iterator cv;
+        };
+        };
+        template <typename> struct cw;
+        } // namespace j
+        template <class ce, class k = j::cr<ce>, class cq = j::cs<ce>,
+                class cx = std::allocator<ce>>
+        class cy : public j::ct<j::cw<ce>, k, cq, cx> {};
+        } // namespace absl
+        namespace cz {
+        template <typename da> class db { std::ag<sizeof(a), alignof(da)> c; };
+        } // namespace cz
+        namespace spanner {
+        class l;
+        class ColumnList {
+        public:
+        typedef absl::cj<l>::iterator iterator;
+        iterator begin();
+        };
+        class dd {
+        union {
+            cz::db<absl::cy<bv>::cu> e;
+        };
+        };
+        class Row {
+        public:
+        bool f(dd);
+        };
+        } // namespace spanner
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["spanner::Row", "spanner::ColumnList"], &[]);
+}
+
+#[test]
+#[ignore] // https://github.com/google/autocxx/issues/489
+fn test_immovable_object() {
+    let hdr = indoc! {"
+        class A {
+        public:
+            A();
+            A(A&&) = delete;
+        };
+
+        class B{
+        public:
+            B();
+            B(const B&) = delete;
+        };
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["A", "B"], &[]);
+}
+
+#[test]
+fn test_type_called_type() {
+    let hdr = indoc! {"
+        namespace a {
+            template<int _Len>
+            struct b
+            {
+                union type
+                {
+                    unsigned char __data[_Len];
+                    struct foo {
+                        int a;
+                    };
+                };
+            };
+        }
+        inline void take_type(a::b<4>::type) {}
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["take_type"], &[]);
+}
+
+#[test]
+fn test_bridge_conflict_ty() {
+    let hdr = indoc! {"
+        namespace a {
+            struct Key { int a; };
+        }
+        namespace b {
+            struct Key { int a; };
+        }
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["a::Key", "b::Key"], &[]);
+}
+
+#[test]
+fn test_bridge_conflict_ty_fn() {
+    let hdr = indoc! {"
+        namespace a {
+            struct Key { int a; };
+        }
+        namespace b {
+            inline void Key() {}
+        }
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["a::Key", "b::Key"], &[]);
+}
+
+#[test]
+fn test_issue_506() {
+    let hdr = indoc! {"
+        namespace std {
+            template <class, class> class am;
+            typedef am<char, char> an;
+        } // namespace std
+        namespace be {
+            class bf {
+            virtual std::an bg() = 0;
+            };
+            class bh : bf {};
+        } // namespace be
+        namespace spanner {
+            class Database;
+            class Row {
+            public:
+            Row(be::bh *);
+            };
+        } // namespace spanner
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["spanner::Database", "spanner::Row"], &[]);
+}
+
 fn find_ffi_items(f: syn::File) -> Result<Vec<Item>, TestError> {
     Ok(f.items
         .into_iter()
@@ -4507,25 +5142,20 @@ fn make_error_finder(error_symbol: &str) -> Box<dyn FnOnce(syn::File) -> Result<
     let error_symbol = error_symbol.to_string();
     Box::new(move |f| {
         let ffi_items = find_ffi_items(f)?;
-        // Ensure there's some kind of struct entry for this symboll
-        let foo = ffi_items
+        // Ensure there's some kind of struct entry for this symbol
+        let error_item = ffi_items
             .into_iter()
             .filter_map(|i| match i {
-                Item::Struct(its) if its.ident.to_string() == error_symbol => Some(its),
+                Item::Struct(its) if its.ident == error_symbol => Some(its),
                 _ => None,
             })
             .next()
             .ok_or(TestError::RsCodeExaminationFail)?;
         // Ensure doc attribute
-        foo.attrs
+        error_item
+            .attrs
             .into_iter()
-            .filter(|a| {
-                a.path
-                    .get_ident()
-                    .filter(|p| p.to_string() == "doc")
-                    .is_some()
-            })
-            .next()
+            .find(|a| a.path.get_ident().filter(|p| *p == "doc").is_some())
             .ok_or(TestError::RsCodeExaminationFail)?;
         Ok(())
     })
@@ -4600,8 +5230,29 @@ fn test_error_generated_for_array_dependent_method() {
     );
 }
 
+#[test]
+fn test_keyword_function() {
+    let hdr = indoc! {"
+        inline void move(int a) {};
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["move_"], &[]);
+}
+
+#[test]
+fn test_keyword_method() {
+    let hdr = indoc! {"
+        struct A {
+            int a;
+            inline void move() {};
+        };
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["A"], &[]);
+}
+
 /// Returns a closure which simply hunts for a given string in the results
-fn make_string_finder<'a>(
+fn make_string_finder(
     error_texts: Vec<&str>,
 ) -> Box<dyn FnOnce(syn::File) -> Result<(), TestError> + '_> {
     Box::new(|f| {
@@ -4668,6 +5319,23 @@ fn test_closure() {
 }
 
 #[test]
+fn test_underscored_namespace_for_inner_type() {
+    let hdr = indoc! {"
+        namespace __foo {
+            struct daft {
+                struct bob {
+                    int a;
+                };
+                int a;
+            };
+        }
+        inline void bar(__foo::daft::bob) {}
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["bar"], &[]);
+}
+
+#[test]
 fn test_blocklist_not_overly_broad() {
     // This is a regression test. We used to block anything that starts with "rust" or "std",
     // not just items in the "rust" and "std" namespaces. We therefore test that functions starting
@@ -4684,12 +5352,8 @@ fn test_blocklist_not_overly_broad() {
 }
 
 #[test]
-fn test_stringview_ignored() {
-    // Test that APIs using std::string_view are ignored but do not otherwise cause errors.
-    // This is a regression test: We used to blocklist std::string_view but still import APIs that
-    // use it, which caused cxx to complain that it didn't know about the type.
-    // Once we actually support std::string_view, this test can be extended to actually call
-    // take_string_view().
+fn test_stringview() {
+    // Test that APIs using std::string_view do not otherwise cause errors.
     let hdr = indoc! {"
         #include <string_view>
         #include <string>
@@ -4705,18 +5369,499 @@ fn test_stringview_ignored() {
         &[],
         None,
         &["-std=c++17"],
-        Some(make_string_finder(
-            ["take_string_view", "return_string_view", "std::string_view"].to_vec(),
-        )),
+        None,
+    );
+}
+
+#[test]
+fn test_include_cpp_alone() {
+    let hdr = indoc! {"
+        #include <cstdint>
+        inline uint32_t give_int() {
+            return 5;
+        }
+    "};
+    let rs = |hdr| {
+        let hexathorpe = Token![#](Span::call_site());
+        quote! {
+            use autocxx::include_cpp;
+            include_cpp! {
+                #hexathorpe include #hdr
+                safety!(unsafe_ffi)
+                generate!("give_int")
+            }
+            fn main() {
+                assert_eq!(ffi::give_int(), 5);
+            }
+        }
+    };
+    do_run_test_manual("", hdr, rs, &[], None).unwrap();
+}
+
+#[test]
+fn test_include_cpp_in_path() {
+    let hdr = indoc! {"
+        #include <cstdint>
+        inline uint32_t give_int() {
+            return 5;
+        }
+    "};
+    let rs = |hdr| {
+        let hexathorpe = Token![#](Span::call_site());
+        quote! {
+            autocxx::include_cpp! {
+                #hexathorpe include #hdr
+                safety!(unsafe_ffi)
+                generate!("give_int")
+            }
+            fn main() {
+                assert_eq!(ffi::give_int(), 5);
+            }
+        }
+    };
+    do_run_test_manual("", hdr, rs, &[], None).unwrap();
+}
+
+#[test]
+fn test_bitset() {
+    let hdr = indoc! {"
+        #include <cstddef>
+        template <size_t _N_words, size_t _Size>
+        class __bitset
+        {
+        public:
+            typedef size_t              __storage_type;
+            __storage_type __first_[_N_words];
+            inline bool all() {}
+        };
+
+        template <size_t _Size>
+        class __attribute__ ((__type_visibility__(\"default\"))) bitset
+            : private __bitset<_Size == 0 ? 0 : (_Size - 1) / (sizeof(size_t) * 8) + 1, _Size>
+        {
+        public:
+            static const unsigned __n_words = _Size == 0 ? 0 : (_Size - 1) / (sizeof(size_t) * 8) + 1;
+            typedef __bitset<__n_words, _Size> base;
+            bool all() const noexcept;
+        };
+
+
+        typedef bitset<1> mybitset;
+    "};
+
+    let rs = quote! {};
+
+    run_test_ex(
+        "",
+        hdr,
+        rs,
+        &[],
+        &[],
+        Some(quote! {
+            generate_all!()
+        }),
+        &[],
+        None,
+    );
+}
+
+#[test]
+fn test_cint_vector() {
+    let hdr = indoc! {"
+        #include <vector>
+        #include <cstdint>
+        inline std::vector<int32_t> give_vec() {
+            return std::vector<int32_t> {1,2};
+        }
+    "};
+
+    let rs = quote! {
+        assert_eq!(ffi::give_vec().as_ref().unwrap().as_slice(), &[1,2]);
+    };
+
+    run_test("", hdr, rs, &["give_vec"], &[]);
+}
+
+#[test]
+#[ignore] // https://github.com/google/autocxx/issues/422
+fn test_int_vector() {
+    let hdr = indoc! {"
+        #include <vector>
+        std::vector<int> give_vec() {
+            return std::vector<int> {1,2};
+        }
+    "};
+
+    let rs = quote! {
+        assert_eq!(ffi::give_vec().as_ref().unwrap().as_slice(), &[autocxx::c_int(1),autocxx::c_int(2)]);
+    };
+
+    run_test("", hdr, rs, &["give_vec"], &[]);
+}
+
+#[test]
+fn test_deleted_function() {
+    // We shouldn't generate bindings for deleted functions.
+    // The test is successful if the bindings compile, i.e. if autocxx doesn't
+    // attempt to call the deleted function.
+    let hdr = indoc! {"
+        class A {
+        public:
+            void foo() = delete;
+        };
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["A"], &[]);
+}
+
+#[test]
+fn test_ignore_move_constructor() {
+    // Test that we don't generate bindings for move constructors and,
+    // specifically, don't erroneously import them as copy constructors.
+    // We used to do this because bindgen creates the same Rust signature for
+    // move constructors and for copy constructors.
+    // The way this tests works is a bit subtle.  Declaring a move constructor
+    // causes the copy constructor to be implicitly deleted (unless it is]
+    // explicitly declared). If we erroneously tried to create a binding for the
+    // move constructor (because the signature led us to believe it is a copy
+    // constructor), the generated C++ code would therefore try to call the
+    // deleted copy constructor, which would result in a compile error.
+    // The test is therefore successful if the bindings compile.
+    let hdr = indoc! {"
+        class A {
+        public:
+            A(A&&);
+        };
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["A"], &[]);
+}
+
+#[test]
+fn test_overloaded_ignored_function() {
+    // When overloaded functions are ignored during import, the placeholder
+    // functions generated for them should have unique names, just as they
+    // would have if they had ben imported successfully.
+    // The test is successful if the bindings compile.
+    let hdr = indoc! {"
+        struct Blocked {};
+        class A {
+        public:
+            void take_blocked(Blocked);
+            void take_blocked(Blocked, int);
+        };
+    "};
+    let rs = quote! {};
+    run_test_ex(
+        "",
+        hdr,
+        rs,
+        &["A"],
+        &[],
+        Some(quote! { block!("Blocked") }),
+        &[],
+        None,
+    );
+}
+
+#[test]
+fn test_namespaced_constant() {
+    let hdr = indoc! {"
+        namespace A {
+            const int kConstant = 3;
+        }
+    "};
+    let rs = quote! {
+        assert_eq!(ffi::A::kConstant, 3);
+    };
+    run_test("", hdr, rs, &["A::kConstant"], &[]);
+}
+
+#[test]
+fn test_issue_470_492() {
+    let hdr = indoc! {"
+        namespace std {
+            template <bool, typename _Iftrue, typename _Iffalse> struct a;
+        }
+        template <typename> struct b;
+        template <typename d> struct c {
+            typedef std::a<b<d>::c, int, int> e;
+        };
+    "};
+    let rs = quote! {};
+    run_test_ex(
+        "",
+        hdr,
+        rs,
+        &[],
+        &[],
+        Some(quote! {
+            generate_all!()
+        }),
+        &[],
+        None,
+    );
+}
+
+#[test]
+fn test_no_impl() {
+    let hdr = indoc! {"
+        struct A {
+            int a;
+        };
+    "};
+    let rs = quote! {};
+    run_test_ex(
+        "",
+        hdr,
+        rs,
+        &["A"],
+        &[],
+        Some(quote! {
+            exclude_impls!()
+            exclude_utilities!()
+        }),
+        &[],
+        None,
+    );
+}
+
+#[test]
+fn test_generate_all() {
+    let hdr = indoc! {"
+        #include <cstdint>
+        inline uint32_t give_int() {
+            return 5;
+        }
+    "};
+    let rs = quote! {
+        assert_eq!(ffi::give_int(), 5);
+    };
+    run_test_ex(
+        "",
+        hdr,
+        rs,
+        &[],
+        &[],
+        Some(quote! {
+            generate_all!()
+        }),
+        &[],
+        None,
+    );
+}
+
+#[test]
+fn test_std_thing() {
+    let hdr = indoc! {"
+        #include <cstdint>
+        namespace std {
+            struct A {
+                uint8_t a;
+            };
+        }
+        typedef char daft;
+    "};
+    let rs = quote! {};
+    run_test_ex(
+        "",
+        hdr,
+        rs,
+        &[],
+        &[],
+        Some(quote! {
+            generate_all!()
+        }),
+        &[],
+        None,
+    );
+}
+
+#[test]
+fn test_two_mods() {
+    let hdr = indoc! {"
+        #include <cstdint>
+        struct A {
+            uint32_t a;
+        };
+        inline A give_a() {
+            A a;
+            a.a = 5;
+            return a;
+        }
+        inline uint32_t get_a(A a) {
+            return a.a;
+        }
+        struct B {
+            uint32_t a;
+        };
+        inline B give_b() {
+            B a;
+            a.a = 8;
+            return a;
+        }
+        inline uint32_t get_b(B a) {
+            return a.a;
+        }
+    "};
+    let rs = |hdr| {
+        let hexathorpe = Token![#](Span::call_site());
+        quote! {
+            autocxx::include_cpp! {
+                #hexathorpe include #hdr
+                safety!(unsafe_ffi)
+                generate!("give_a")
+                generate!("get_a")
+            }
+            autocxx::include_cpp! {
+                #hexathorpe include #hdr
+                name!(ffi2)
+                generate!("give_b")
+                generate!("get_b")
+            }
+            fn main() {
+                let a = ffi::give_a();
+                assert_eq!(ffi::get_a(a), 5);
+                let b = unsafe { ffi2::give_b() };
+                assert_eq!(unsafe { ffi2::get_b(b) }, 8);
+            }
+        }
+    };
+    do_run_test_manual("", hdr, rs, &[], None).unwrap();
+}
+
+#[test]
+fn test_manual_bridge() {
+    let hdr = indoc! {"
+        #include <cstdint>
+        inline uint32_t give_int() {
+            return 5;
+        }
+        inline uint32_t give_int2() {
+            return 5;
+        }
+    "};
+    let rs = |hdr| {
+        let hexathorpe = Token![#](Span::call_site());
+        quote! {
+            autocxx::include_cpp! {
+                #hexathorpe include #hdr
+                safety!(unsafe_ffi)
+                generate!("give_int")
+            }
+            #[cxx::bridge]
+            mod ffi2 {
+                unsafe extern "C++" {
+                    include!(#hdr);
+                    fn give_int2() -> u32;
+                }
+            }
+            fn main() {
+                assert_eq!(ffi::give_int(), 5);
+                assert_eq!(ffi2::give_int2(), 5);
+            }
+        }
+    };
+    do_run_test_manual("", hdr, rs, &[], None).unwrap();
+}
+
+#[test]
+fn test_manual_bridge_mixed_types() {
+    let hdr = indoc! {"
+        #include <memory>
+        struct A {
+            int a;
+        };
+        inline int take_A(const A& a) {
+            return a.a;
+        }
+        inline std::unique_ptr<A> give_A() {
+            auto a = std::make_unique<A>();
+            a->a = 5;
+            return a;
+        }
+    "};
+    let rs = |hdr| {
+        let hexathorpe = Token![#](Span::call_site());
+        quote! {
+            autocxx::include_cpp! {
+                #hexathorpe include #hdr
+                safety!(unsafe_ffi)
+                generate!("take_A")
+                generate!("A")
+            }
+            #[cxx::bridge]
+            mod ffi2 {
+                unsafe extern "C++" {
+                    include!(#hdr);
+                    type A = crate::ffi::A;
+                    fn give_A() -> UniquePtr<A>;
+                }
+            }
+            fn main() {
+                let a = ffi2::give_A();
+                assert_eq!(ffi::take_A(&a), autocxx::c_int(5));
+            }
+        }
+    };
+    do_run_test_manual("", hdr, rs, &[], None).unwrap();
+}
+
+#[test]
+fn test_issue486() {
+    let hdr = indoc! {"
+        namespace a {
+            namespace spanner {
+                class Key;
+            }
+        } // namespace a
+        namespace spanner {
+            class Key {
+                public:
+                    bool b(a::spanner::Key &);
+            };
+        } // namespace spanner
+    "};
+    let rs = quote! {};
+    run_test("", hdr, rs, &["spanner::Key"], &[]);
+}
+
+#[test]
+fn test_shared_ptr() {
+    let hdr = indoc! {"
+        #include <memory>
+        struct A {
+            int a;
+        };
+        inline std::shared_ptr<A> make_shared_int() {
+            return std::make_shared<A>(A { 3 });
+        }
+        inline int take_shared_int(std::shared_ptr<A> a) {
+            return a->a;
+        }
+        inline std::weak_ptr<A> shared_to_weak(std::shared_ptr<A> a) {
+            return std::weak_ptr<A>(a);
+        }
+    "};
+    let rs = quote! {
+        let a = ffi::make_shared_int();
+        assert_eq!(ffi::take_shared_int(a.clone()), autocxx::c_int(3));
+        ffi::shared_to_weak(a).upgrade();
+    };
+    run_test(
+        "",
+        hdr,
+        rs,
+        &["make_shared_int", "take_shared_int", "shared_to_weak"],
+        &[],
     );
 }
 
 // Yet to test:
-// 6. Ifdef
-// 7. Out param pointers
-// 10. ExcludeUtilities
-// Stuff which requires much more thought:
-// 1. Shared pointers
+// - Ifdef
+// - Out param pointers
+// - ExcludeUtilities
+// - Struct fields which are typedefs
 // Negative tests:
-// 1. Private methods
-// 2. Private fields
+// - Private methods
+// - Private fields

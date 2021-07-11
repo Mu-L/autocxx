@@ -13,16 +13,23 @@
 // limitations under the License.
 
 use crate::{
-    conversion::{api::UnanalyzedApi, codegen_cpp::type_to_cpp::type_to_cpp, ConvertError},
+    conversion::{
+        api::{AnalysisPhase, Api, ApiName, TypedefKind, UnanalyzedApi},
+        codegen_cpp::type_to_cpp::type_to_cpp,
+        ConvertError,
+    },
     known_types::known_types,
     types::{make_ident, Namespace, QualifiedName},
 };
+use autocxx_parser::IncludeCppConfig;
 use quote::ToTokens;
 use std::collections::{HashMap, HashSet};
 use syn::{
     parse_quote, punctuated::Punctuated, GenericArgument, PathArguments, PathSegment, Type,
     TypePath, TypePtr,
 };
+
+use super::tdef::TypedefAnalysisBody;
 
 /// Results of some type conversion, annotated with a list of every type encountered,
 /// and optionally any extra APIs we need in order to use this type.
@@ -58,69 +65,93 @@ impl<T> Annotated<T> {
     }
 }
 
+/// Options when converting a type.
+/// It's possible we could add more policies here in future.
+/// For example, Rust in general allows type names containing
+/// __, whereas cxx doesn't. If we could identify cases where
+/// a type will only ever be used in a bindgen context,
+/// we could be more liberal. At the moment though, all outputs
+/// from [TypeConverter] _might_ be used in the [cxx::bridge].
+pub(crate) enum TypeConversionContext {
+    CxxInnerType,
+    CxxOuterType { convert_ptrs_to_references: bool },
+}
+
+impl TypeConversionContext {
+    fn convert_ptrs_to_references(&self) -> bool {
+        matches!(
+            self,
+            TypeConversionContext::CxxOuterType {
+                convert_ptrs_to_references: true,
+                ..
+            }
+        )
+    }
+    fn allow_instantiation_of_forward_declaration(&self) -> bool {
+        matches!(self, TypeConversionContext::CxxInnerType)
+    }
+}
+
 /// A type which can convert from a type encountered in `bindgen`
 /// output to the sort of type we should represeent to `cxx`.
 /// As a simple example, `std::string` should be replaced
 /// with [CxxString]. This also involves keeping track
 /// of typedefs, and any instantiated concrete types.
 ///
-/// This object is a bit of a pest. The information here
-/// is compiled during the parsing phase (which is why it lives
-/// in the parse mod) but is used during various other phases.
-/// As such it contributes to both the parsing and analysis phases.
-/// It's possible that the information here largely duplicates
-/// information stored elsewhere in the list of `Api`s, or can
-/// easily be moved into it, which would enable us to
-/// distribute this logic elsewhere.
-pub(crate) struct TypeConverter {
-    types_found: Vec<QualifiedName>,
+/// To do this conversion correctly, this type relies on
+/// inspecting the pre-existing list of APIs.
+pub(crate) struct TypeConverter<'a> {
+    types_found: HashSet<QualifiedName>,
     typedefs: HashMap<QualifiedName, Type>,
     concrete_templates: HashMap<String, QualifiedName>,
+    forward_declarations: HashSet<QualifiedName>,
+    config: &'a IncludeCppConfig,
 }
 
-impl TypeConverter {
-    pub(crate) fn new() -> Self {
+impl<'a> TypeConverter<'a> {
+    pub(crate) fn new<A: AnalysisPhase>(config: &'a IncludeCppConfig, apis: &[Api<A>]) -> Self
+    where
+        A::TypedefAnalysis: TypedefTarget,
+    {
         Self {
-            types_found: Vec::new(),
-            typedefs: HashMap::new(),
-            concrete_templates: HashMap::new(),
+            types_found: Self::find_types(apis),
+            typedefs: Self::find_typedefs(apis),
+            concrete_templates: Self::find_concrete_templates(apis),
+            forward_declarations: Self::find_incomplete_types(apis),
+            config,
         }
-    }
-
-    pub(crate) fn push(&mut self, ty: QualifiedName) {
-        self.types_found.push(ty);
-    }
-
-    pub(crate) fn insert_typedef(&mut self, id: QualifiedName, target: Type) {
-        self.typedefs.insert(id, target);
     }
 
     pub(crate) fn convert_boxed_type(
         &mut self,
         ty: Box<Type>,
         ns: &Namespace,
-        convert_ptrs_to_reference: bool,
+        ctx: &TypeConversionContext,
     ) -> Result<Annotated<Box<Type>>, ConvertError> {
-        Ok(self
-            .convert_type(*ty, ns, convert_ptrs_to_reference)?
-            .map(Box::new))
+        Ok(self.convert_type(*ty, ns, ctx)?.map(Box::new))
     }
 
     pub(crate) fn convert_type(
         &mut self,
         ty: Type,
         ns: &Namespace,
-        convert_ptrs_to_reference: bool,
+        ctx: &TypeConversionContext,
     ) -> Result<Annotated<Type>, ConvertError> {
         let result = match ty {
             Type::Path(p) => {
-                let newp = self.convert_type_path(p, ns)?;
+                let newp = self.convert_type_path(p, ns, ctx)?;
                 if let Type::Path(newpp) = &newp.ty {
+                    let qn = QualifiedName::from_type_path(newpp);
+                    if !ctx.allow_instantiation_of_forward_declaration()
+                        && self.forward_declarations.contains(&qn)
+                    {
+                        return Err(ConvertError::TypeContainingForwardDeclaration(qn));
+                    }
                     // Special handling because rust_Str (as emitted by bindgen)
                     // doesn't simply get renamed to a different type _identifier_.
                     // This plain type-by-value (as far as bindgen is concerned)
                     // is actually a &str.
-                    if known_types().should_dereference_in_cpp(newpp) {
+                    if known_types().should_dereference_in_cpp(&qn) {
                         Annotated::new(
                             Type::Reference(parse_quote! {
                                 &str
@@ -137,7 +168,8 @@ impl TypeConverter {
                 }
             }
             Type::Reference(mut r) => {
-                let innerty = self.convert_boxed_type(r.elem, ns, false)?;
+                let innerty =
+                    self.convert_boxed_type(r.elem, ns, &TypeConversionContext::CxxInnerType)?;
                 r.elem = innerty.ty;
                 Annotated::new(
                     Type::Reference(r),
@@ -146,12 +178,13 @@ impl TypeConverter {
                     false,
                 )
             }
-            Type::Ptr(ptr) if convert_ptrs_to_reference => {
+            Type::Ptr(ptr) if ctx.convert_ptrs_to_references() => {
                 self.convert_ptr_to_reference(ptr, ns)?
             }
             Type::Ptr(mut ptr) => {
                 crate::known_types::ensure_pointee_is_valid(&ptr)?;
-                let innerty = self.convert_boxed_type(ptr.elem, ns, false)?;
+                let innerty =
+                    self.convert_boxed_type(ptr.elem, ns, &TypeConversionContext::CxxInnerType)?;
                 ptr.elem = innerty.ty;
                 Annotated::new(
                     Type::Ptr(ptr),
@@ -169,6 +202,7 @@ impl TypeConverter {
         &mut self,
         mut typ: TypePath,
         ns: &Namespace,
+        ctx: &TypeConversionContext,
     ) -> Result<Annotated<Type>, ConvertError> {
         // First, qualify any unqualified paths.
         if typ.path.segments.iter().next().unwrap().ident != "root" {
@@ -196,6 +230,10 @@ impl TypeConverter {
         }
 
         let original_tn = QualifiedName::from_type_path(&typ);
+        original_tn.validate_ok_for_cxx()?;
+        if self.config.is_on_blocklist(&original_tn.to_cpp_name()) {
+            return Err(ConvertError::Blocked(original_tn));
+        }
         let mut deps = HashSet::new();
 
         // Now convert this type itself.
@@ -208,19 +246,20 @@ impl TypeConverter {
                 deps.insert(resolved_tn.clone());
                 (resolved_tp.clone(), resolved_tn)
             }
-            Some(other) => {
+            Some(Type::Ptr(resolved_tp)) => {
                 return Ok(Annotated::new(
-                    other.clone(),
-                    HashSet::new(),
+                    Type::Ptr(resolved_tp.clone()),
+                    deps,
                     Vec::new(),
-                    false,
+                    true,
                 ))
             }
+            Some(other) => return Ok(Annotated::new(other.clone(), deps, Vec::new(), false)),
         };
 
         // Now let's see if it's a known type.
         // (We may entirely reject some types at this point too.)
-        let mut typ = match known_types().consider_substitution(&tn)? {
+        let mut typ = match known_types().consider_substitution(&tn) {
             Some(mut substitute_type) => {
                 if let Some(last_seg_args) =
                     typ.path.segments.into_iter().last().map(|ps| ps.arguments)
@@ -240,9 +279,10 @@ impl TypeConverter {
             if known_types().is_cxx_acceptable_generic(&tn) {
                 // this is a type of generic understood by cxx (e.g. CxxVector)
                 // so let's convert any generic type arguments. This recurses.
-                crate::known_types::confirm_inner_type_is_acceptable_generic_payload(
+                self.confirm_inner_type_is_acceptable_generic_payload(
                     &last_seg.arguments,
                     &tn,
+                    ctx,
                 )?;
                 if let PathArguments::AngleBracketed(ref mut ab) = last_seg.arguments {
                     let mut innerty = self.convert_punctuated(ab.args.clone(), ns)?;
@@ -284,7 +324,8 @@ impl TypeConverter {
         for arg in pun.into_iter() {
             new_pun.push(match arg {
                 GenericArgument::Type(t) => {
-                    let mut innerty = self.convert_type(t, ns, false)?;
+                    let mut innerty =
+                        self.convert_type(t, ns, &TypeConversionContext::CxxInnerType)?;
                     types_encountered.extend(innerty.types_encountered.drain());
                     extra_apis.extend(innerty.extra_apis.drain(..));
                     GenericArgument::Type(innerty.ty)
@@ -316,29 +357,19 @@ impl TypeConverter {
         ns: &Namespace,
     ) -> Result<Annotated<Type>, ConvertError> {
         let mutability = ptr.mutability;
-        let elem = self.convert_boxed_type(ptr.elem, ns, false)?;
+        let elem = self.convert_boxed_type(ptr.elem, ns, &TypeConversionContext::CxxInnerType)?;
         // TODO - in the future, we should check if this is a rust::Str and throw
         // a wobbler if not. rust::Str should only be seen _by value_ in C++
         // headers; it manifests as &str in Rust but on the C++ side it must
         // be a plain value. We should detect and abort.
         Ok(elem.map(|elem| match mutability {
             Some(_) => Type::Path(parse_quote! {
-                std::pin::Pin < & #mutability #elem >
+                ::std::pin::Pin < & #mutability #elem >
             }),
             None => Type::Reference(parse_quote! {
                 & #elem
             }),
         }))
-    }
-
-    fn add_concrete_type(&self, name: &QualifiedName, rs_definition: &Type) -> UnanalyzedApi {
-        UnanalyzedApi {
-            name: name.clone(),
-            deps: HashSet::new(),
-            detail: crate::conversion::api::ApiDetail::ConcreteType {
-                rs_definition: Box::new(rs_definition.clone()),
-            },
-        }
     }
 
     fn get_templated_typename(
@@ -347,20 +378,165 @@ impl TypeConverter {
     ) -> Result<(QualifiedName, Option<UnanalyzedApi>), ConvertError> {
         let count = self.concrete_templates.len();
         // We just use this as a hash key, essentially.
-        let cpp_definition = type_to_cpp(rs_definition)?;
+        // TODO: Once we've completed the TypeConverter refactoring (see #220),
+        // pass in an actual original_name_map here.
+        let cpp_definition = type_to_cpp(rs_definition, &HashMap::new())?;
         let e = self.concrete_templates.get(&cpp_definition);
         match e {
             Some(tn) => Ok((tn.clone(), None)),
             None => {
-                let tn = QualifiedName::new(
-                    &Namespace::new(),
-                    make_ident(&format!("AutocxxConcrete{}", count)),
-                );
+                let api = UnanalyzedApi::ConcreteType {
+                    name: ApiName::new_in_root_namespace(make_ident(&format!(
+                        "AutocxxConcrete{}",
+                        count
+                    ))),
+                    rs_definition: Box::new(rs_definition.clone()),
+                    cpp_definition: cpp_definition.clone(),
+                };
                 self.concrete_templates
-                    .insert(cpp_definition.clone(), tn.clone());
-                let api = self.add_concrete_type(&tn, rs_definition);
-                Ok((tn, Some(api)))
+                    .insert(cpp_definition, api.name().clone());
+                Ok((api.name().clone(), Some(api)))
             }
+        }
+    }
+
+    fn confirm_inner_type_is_acceptable_generic_payload(
+        &self,
+        path_args: &PathArguments,
+        desc: &QualifiedName,
+        ctx: &TypeConversionContext,
+    ) -> Result<(), ConvertError> {
+        // For now, all supported generics accept the same payloads. This
+        // may change in future in which case we'll need to accept more arguments here.
+        match path_args {
+            PathArguments::None => Ok(()),
+            PathArguments::Parenthesized(_) => Err(
+                ConvertError::TemplatedTypeContainingNonPathArg(desc.clone()),
+            ),
+            PathArguments::AngleBracketed(ab) => {
+                for inner in &ab.args {
+                    match inner {
+                        GenericArgument::Type(Type::Path(typ)) => {
+                            let inner_qn = QualifiedName::from_type_path(&typ);
+                            if !ctx.allow_instantiation_of_forward_declaration()
+                                && self.forward_declarations.contains(&inner_qn)
+                            {
+                                return Err(ConvertError::TypeContainingForwardDeclaration(
+                                    inner_qn,
+                                ));
+                            }
+                            if let Some(more_generics) = typ.path.segments.last() {
+                                self.confirm_inner_type_is_acceptable_generic_payload(
+                                    &more_generics.arguments,
+                                    desc,
+                                    ctx,
+                                )?;
+                            }
+                        }
+                        _ => {
+                            return Err(ConvertError::TemplatedTypeContainingNonPathArg(
+                                desc.clone(),
+                            ))
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn find_types<A: AnalysisPhase>(apis: &[Api<A>]) -> HashSet<QualifiedName> {
+        apis.iter()
+            .filter_map(|api| match api {
+                Api::ForwardDeclaration { .. }
+                | Api::ConcreteType { .. }
+                | Api::Typedef { .. }
+                | Api::Enum { .. }
+                | Api::Struct { .. } => Some(api.name()),
+                Api::StringConstructor { .. }
+                | Api::Function { .. }
+                | Api::Const { .. }
+                | Api::CType { .. }
+                | Api::IgnoredItem { .. } => None,
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn find_typedefs<A: AnalysisPhase>(apis: &[Api<A>]) -> HashMap<QualifiedName, Type>
+    where
+        A::TypedefAnalysis: TypedefTarget,
+    {
+        apis.iter()
+            .filter_map(|api| match &api {
+                Api::Typedef { analysis, .. } => analysis
+                    .get_target()
+                    .cloned()
+                    .map(|ty| (api.name().clone(), ty)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn find_concrete_templates<A: AnalysisPhase>(
+        apis: &[Api<A>],
+    ) -> HashMap<String, QualifiedName> {
+        apis.iter()
+            .filter_map(|api| match &api {
+                Api::ConcreteType { cpp_definition, .. } => {
+                    Some((cpp_definition.clone(), api.name().clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn find_incomplete_types<A: AnalysisPhase>(apis: &[Api<A>]) -> HashSet<QualifiedName> {
+        apis.iter()
+            .filter_map(|api| match api {
+                Api::ForwardDeclaration { .. } => Some(api.name()),
+                _ => None,
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// Processing functions sometimes results in new types being materialized.
+/// These types haven't been through the analysis phases (chicken and egg
+/// problem) but fortunately, don't need to. We need to keep the type
+/// system happy by adding an [ApiAnalysis] but in practice, for the sorts
+/// of things that get created, it's always blank.
+pub(crate) fn add_analysis<A: AnalysisPhase>(api: UnanalyzedApi) -> Api<A> {
+    match api {
+        Api::ConcreteType {
+            name,
+            rs_definition,
+            cpp_definition,
+        } => Api::ConcreteType {
+            name,
+            rs_definition,
+            cpp_definition,
+        },
+        Api::IgnoredItem { name, err, ctx } => Api::IgnoredItem { name, err, ctx },
+        _ => panic!("Function analysis created an unexpected type of extra API"),
+    }
+}
+pub(crate) trait TypedefTarget {
+    fn get_target(&self) -> Option<&Type>;
+}
+
+impl TypedefTarget for () {
+    fn get_target(&self) -> Option<&Type> {
+        None
+    }
+}
+
+impl TypedefTarget for TypedefAnalysisBody {
+    fn get_target(&self) -> Option<&Type> {
+        match self.kind {
+            TypedefKind::Type(ref ty) => Some(&ty.ty),
+            TypedefKind::Use(_) => None,
         }
     }
 }

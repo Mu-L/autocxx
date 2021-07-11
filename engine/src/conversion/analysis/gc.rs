@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use autocxx_parser::TypeConfig;
+use autocxx_parser::IncludeCppConfig;
 
 use crate::{conversion::api::Api, types::QualifiedName};
 
@@ -39,19 +39,20 @@ use super::fun::FnAnalysis;
 ///    APIs either.
 pub(crate) fn filter_apis_by_following_edges_from_allowlist(
     mut apis: Vec<Api<FnAnalysis>>,
-    type_config: &TypeConfig,
+    config: &IncludeCppConfig,
 ) -> Vec<Api<FnAnalysis>> {
-    let mut todos: Vec<_> = apis
+    let mut todos: Vec<QualifiedName> = apis
         .iter()
         .filter(|api| {
             let tnforal = api.typename_for_allowlist();
-            type_config.is_on_allowlist(&tnforal.to_cpp_name())
+            config.is_on_allowlist(&tnforal.to_cpp_name())
         })
-        .map(Api::typename)
+        .map(Api::name)
+        .cloned()
         .collect();
     let mut by_typename: HashMap<QualifiedName, Vec<Api<FnAnalysis>>> = HashMap::new();
     for api in apis.drain(..) {
-        let tn = api.typename();
+        let tn = api.name().clone();
         by_typename.entry(tn).or_default().push(api);
     }
     let mut done = HashSet::new();
@@ -62,7 +63,7 @@ pub(crate) fn filter_apis_by_following_edges_from_allowlist(
             continue;
         }
         if let Some(mut these_apis) = by_typename.remove(&todo) {
-            todos.extend(these_apis.iter().flat_map(|api| api.deps.iter().cloned()));
+            todos.extend(these_apis.iter().flat_map(|api| api.deps().cloned()));
             output.append(&mut these_apis);
         } // otherwise, probably an intrinsic e.g. uint32_t.
         done.insert(todo);

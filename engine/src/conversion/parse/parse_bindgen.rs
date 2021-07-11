@@ -14,30 +14,32 @@
 
 use std::collections::HashSet;
 
-use crate::conversion::{
-    convert_error::{ConvertErrorWithContext, ErrorContext},
-    error_reporter::report_any_error,
-    parse::type_converter::Annotated,
-};
 use crate::{
     conversion::{
-        api::{ApiDetail, ParseResults, TypedefKind, UnanalyzedApi},
+        api::{ApiName, TypedefKind, UnanalyzedApi},
         ConvertError,
     },
     types::Namespace,
     types::QualifiedName,
 };
-use autocxx_parser::TypeConfig;
-use syn::{parse_quote, Fields, Item, Type, TypePath, UseTree};
+use crate::{
+    conversion::{
+        convert_error::{ConvertErrorWithContext, ErrorContext},
+        error_reporter::report_any_error,
+    },
+    types::validate_ident_ok_for_cxx,
+};
+use autocxx_parser::IncludeCppConfig;
+use syn::{parse_quote, Attribute, Fields, Ident, Item, LitStr, TypePath, UseTree};
 
-use super::{super::utilities::generate_utilities, type_converter::TypeConverter};
+use super::super::utilities::generate_utilities;
 
 use super::parse_foreign_mod::ParseForeignMod;
 
 /// Parses a bindgen mod in order to understand the APIs within it.
 pub(crate) struct ParseBindgen<'a> {
-    type_config: &'a TypeConfig,
-    results: ParseResults,
+    config: &'a IncludeCppConfig,
+    apis: Vec<UnanalyzedApi>,
     /// Here we track the last struct which bindgen told us about.
     /// Any subsequent "extern 'C'" blocks are methods belonging to that type,
     /// even if the 'this' is actually recorded as void in the
@@ -45,14 +47,49 @@ pub(crate) struct ParseBindgen<'a> {
     latest_virtual_this_type: Option<QualifiedName>,
 }
 
+pub(crate) fn api_name(ns: &Namespace, id: Ident, attrs: &[Attribute]) -> ApiName {
+    ApiName {
+        name: QualifiedName::new(ns, id),
+        cpp_name: get_bindgen_original_name_annotation(attrs),
+    }
+}
+
+pub(crate) fn api_name_qualified(
+    ns: &Namespace,
+    id: Ident,
+    attrs: &[Attribute],
+) -> Result<ApiName, ConvertErrorWithContext> {
+    match validate_ident_ok_for_cxx(&id.to_string()) {
+        Err(e) => {
+            let ctx = ErrorContext::Item(id);
+            Err(ConvertErrorWithContext(e, Some(ctx)))
+        }
+        Ok(..) => Ok(api_name(ns, id, attrs)),
+    }
+}
+
+fn get_bindgen_original_name_annotation(attrs: &[Attribute]) -> Option<String> {
+    attrs
+        .iter()
+        .filter_map(|a| {
+            if a.path.is_ident("bindgen_original_name") {
+                let r: Result<LitStr, syn::Error> = a.parse_args();
+                match r {
+                    Ok(ls) => Some(ls.value()),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        })
+        .next()
+}
+
 impl<'a> ParseBindgen<'a> {
-    pub(crate) fn new(type_config: &'a TypeConfig) -> Self {
+    pub(crate) fn new(config: &'a IncludeCppConfig) -> Self {
         ParseBindgen {
-            type_config,
-            results: ParseResults {
-                apis: Vec::new(),
-                type_converter: TypeConverter::new(),
-            },
+            config,
+            apis: Vec::new(),
             latest_virtual_this_type: None,
         }
     }
@@ -62,16 +99,15 @@ impl<'a> ParseBindgen<'a> {
     pub(crate) fn parse_items(
         mut self,
         items: Vec<Item>,
-        exclude_utilities: bool,
-    ) -> Result<ParseResults, ConvertError> {
+    ) -> Result<Vec<UnanalyzedApi>, ConvertError> {
         let items = Self::find_items_in_root(items)?;
-        if !exclude_utilities {
-            generate_utilities(&mut self.results.apis);
+        if !self.config.exclude_utilities() {
+            generate_utilities(&mut self.apis, &self.config);
         }
         let root_ns = Namespace::new();
         self.parse_mod_items(items, root_ns);
         self.confirm_all_generate_directives_obeyed()?;
-        Ok(self.results)
+        Ok(self.apis)
     }
 
     fn find_items_in_root(items: Vec<Item>) -> Result<Vec<Item>, ConvertError> {
@@ -104,8 +140,8 @@ impl<'a> ParseBindgen<'a> {
                 self.parse_item(item, &mut mod_converter, &ns)
             });
         }
-        self.results.apis.append(&mut more_apis);
-        mod_converter.finished(&mut self.results.apis);
+        self.apis.append(&mut more_apis);
+        mod_converter.finished(&mut self.apis);
     }
 
     fn parse_item(
@@ -124,22 +160,33 @@ impl<'a> ParseBindgen<'a> {
                 if s.ident.to_string().ends_with("__bindgen_vtable") {
                     return Ok(());
                 }
-                let tyname = QualifiedName::new(ns, s.ident.clone());
                 let is_forward_declaration = Self::spot_forward_declaration(&s.fields);
                 // cxx::bridge can't cope with type aliases to generic
                 // types at the moment.
-                self.parse_type(
-                    tyname.clone(),
-                    is_forward_declaration,
-                    HashSet::new(),
-                    Some(Item::Struct(s)),
-                );
-                self.latest_virtual_this_type = Some(tyname);
+                let name = api_name_qualified(ns, s.ident.clone(), &s.attrs)?;
+                let api = if is_forward_declaration {
+                    UnanalyzedApi::ForwardDeclaration { name }
+                } else {
+                    UnanalyzedApi::Struct {
+                        name,
+                        item: s,
+                        analysis: (),
+                    }
+                };
+                self.latest_virtual_this_type = Some(api.name().clone());
+                if !self.config.is_on_blocklist(&api.name().to_cpp_name()) {
+                    self.apis.push(api);
+                }
                 Ok(())
             }
             Item::Enum(e) => {
-                let tyname = QualifiedName::new(ns, e.ident.clone());
-                self.parse_type(tyname, false, HashSet::new(), Some(Item::Enum(e)));
+                let api = UnanalyzedApi::Enum {
+                    name: api_name_qualified(ns, e.ident.clone(), &e.attrs)?,
+                    item: e,
+                };
+                if !self.config.is_on_blocklist(&api.name().to_cpp_name()) {
+                    self.apis.push(api);
+                }
                 Ok(())
             }
             Item::Impl(imp) => {
@@ -195,19 +242,13 @@ impl<'a> ParseBindgen<'a> {
                                     Some(ErrorContext::Item(new_id.clone())),
                                 ));
                             }
-                            self.results
-                                .type_converter
-                                .insert_typedef(new_tyname, Type::Path(old_path.clone()));
-                            let mut deps = HashSet::new();
-                            deps.insert(old_tyname);
-                            self.results.apis.push(UnanalyzedApi {
-                                name: QualifiedName::new(ns, new_id.clone()),
-                                deps,
-                                detail: ApiDetail::Typedef {
-                                    payload: TypedefKind::Use(parse_quote! {
-                                        pub use #old_path as #new_id;
-                                    }),
-                                },
+                            self.apis.push(UnanalyzedApi::Typedef {
+                                name: api_name(ns, new_id.clone(), &use_item.attrs),
+                                item: TypedefKind::Use(parse_quote! {
+                                    pub use #old_path as #new_id;
+                                }),
+                                old_tyname: Some(old_tyname),
+                                analysis: (),
                             });
                             break;
                         }
@@ -222,54 +263,20 @@ impl<'a> ParseBindgen<'a> {
                 Ok(())
             }
             Item::Const(const_item) => {
-                // The following puts this constant into
-                // the global namespace which is bug
-                // https://github.com/google/autocxx/issues/133
-                self.results.apis.push(UnanalyzedApi {
-                    name: QualifiedName::new(ns, const_item.ident.clone()),
-                    deps: HashSet::new(),
-                    detail: ApiDetail::Const { const_item },
+                self.apis.push(UnanalyzedApi::Const {
+                    name: api_name(ns, const_item.ident.clone(), &const_item.attrs),
+                    const_item,
                 });
                 Ok(())
             }
-            Item::Type(mut ity) => {
-                let tyname = QualifiedName::new(ns, ity.ident.clone());
-                let type_conversion_results =
-                    self.results.type_converter.convert_type(*ity.ty, ns, false);
-                match type_conversion_results {
-                    Err(ConvertError::OpaqueTypeFound) => {
-                        self.add_opaque_type(tyname);
-                        Ok(())
-                    }
-                    Err(err) => Err(ConvertErrorWithContext(
-                        err,
-                        Some(ErrorContext::Item(ity.ident.clone())),
-                    )),
-                    Ok(Annotated {
-                        ty: syn::Type::Path(ref typ),
-                        ..
-                    }) if QualifiedName::from_type_path(typ) == tyname => {
-                        Err(ConvertErrorWithContext(
-                            ConvertError::InfinitelyRecursiveTypedef(tyname),
-                            Some(ErrorContext::Item(ity.ident)),
-                        ))
-                    }
-                    Ok(mut final_type) => {
-                        ity.ty = Box::new(final_type.ty.clone());
-                        self.results
-                            .type_converter
-                            .insert_typedef(tyname, final_type.ty);
-                        self.results.apis.append(&mut final_type.extra_apis);
-                        self.results.apis.push(UnanalyzedApi {
-                            name: QualifiedName::new(ns, ity.ident.clone()),
-                            deps: final_type.types_encountered,
-                            detail: ApiDetail::Typedef {
-                                payload: TypedefKind::Type(ity),
-                            },
-                        });
-                        Ok(())
-                    }
-                }
+            Item::Type(ity) => {
+                self.apis.push(UnanalyzedApi::Typedef {
+                    name: api_name(ns, ity.ident.clone(), &ity.attrs),
+                    item: TypedefKind::Type(ity),
+                    old_tyname: None,
+                    analysis: (),
+                });
+                Ok(())
             }
             _ => Err(ConvertErrorWithContext(
                 ConvertError::UnexpectedItemInMod,
@@ -284,55 +291,15 @@ impl<'a> ParseBindgen<'a> {
             .any(|id| id == "_unused")
     }
 
-    fn add_opaque_type(&mut self, name: QualifiedName) {
-        self.results.apis.push(UnanalyzedApi {
-            name,
-            deps: HashSet::new(),
-            detail: ApiDetail::OpaqueTypedef,
-        });
-    }
-
-    /// Record the Api for a type, e.g. enum or struct.
-    /// Code generated includes the bindgen entry itself,
-    /// various entries for the cxx::bridge to ensure cxx
-    /// is aware of the type, and 'use' statements for the final
-    /// output mod hierarchy. All are stored in the Api which
-    /// this adds.
-    fn parse_type(
-        &mut self,
-        name: QualifiedName,
-        is_forward_declaration: bool,
-        deps: HashSet<QualifiedName>,
-        bindgen_mod_item: Option<Item>,
-    ) {
-        if self.type_config.is_on_blocklist(&name.to_cpp_name()) {
-            return;
-        }
-        let api = UnanalyzedApi {
-            name: name.clone(),
-            deps,
-            detail: ApiDetail::Type {
-                is_forward_declaration,
-                bindgen_mod_item,
-                analysis: (),
-            },
-        };
-        self.results.apis.push(api);
-        self.results.type_converter.push(name);
-    }
-
     fn confirm_all_generate_directives_obeyed(&self) -> Result<(), ConvertError> {
         let api_names: HashSet<_> = self
-            .results
             .apis
             .iter()
-            .map(|api| api.typename().to_cpp_name())
+            .map(|api| api.name().to_cpp_name())
             .collect();
-        for generate_directive in self.type_config.allowlist() {
-            if !api_names.contains(generate_directive) {
-                return Err(ConvertError::DidNotGenerateAnything(
-                    generate_directive.into(),
-                ));
+        for generate_directive in self.config.must_generate_list() {
+            if !api_names.contains(&generate_directive) {
+                return Err(ConvertError::DidNotGenerateAnything(generate_directive));
             }
         }
         Ok(())

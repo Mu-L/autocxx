@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use itertools::Itertools;
 use proc_macro2::Span;
+use quote::ToTokens;
 use std::iter::Peekable;
 use std::{fmt::Display, sync::Arc};
 use syn::{parse_quote, Ident, PathSegment, TypePath};
 
-use crate::known_types::known_types;
+use crate::{conversion::ConvertError, known_types::known_types};
 
 pub(crate) fn make_ident<S: AsRef<str>>(id: S) -> Ident {
     Ident::new(id.as_ref(), Span::call_site())
@@ -129,12 +131,14 @@ impl QualifiedName {
     }
 
     /// Create from user input, e.g. a name in an AllowPOD directive.
-    pub(crate) fn new_from_user_input(id: &str) -> Self {
+    pub(crate) fn new_from_cpp_name(id: &str) -> Self {
         let mut seg_iter = id.split("::").peekable();
         let mut ns = Namespace::new();
         while let Some(seg) = seg_iter.next() {
             if seg_iter.peek().is_some() {
-                ns = ns.push(seg.to_string());
+                if !seg.to_string().is_empty() {
+                    ns = ns.push(seg.to_string());
+                }
             } else {
                 return Self(ns, seg.to_string());
             }
@@ -146,6 +150,12 @@ impl QualifiedName {
     /// qualification. Avoid unless you have a good reason.
     pub(crate) fn get_final_item(&self) -> &str {
         &self.1
+    }
+
+    /// cxx doesn't accept names containing double underscores,
+    /// but these are OK elsewhere in our output mod.
+    pub(crate) fn validate_ok_for_cxx(&self) -> Result<(), ConvertError> {
+        validate_ident_ok_for_cxx(self.get_final_item())
     }
 
     /// Return the actual type name as an [Ident], without any namespace
@@ -172,15 +182,7 @@ impl QualifiedName {
         let special_cpp_name = known_types().special_cpp_name(&self);
         match special_cpp_name {
             Some(name) => name,
-            None => {
-                let mut s = String::new();
-                for seg in &self.0 {
-                    s.push_str(&seg);
-                    s.push_str("::");
-                }
-                s.push_str(&self.1);
-                s
-            }
+            None => self.0.iter().chain(std::iter::once(&self.1)).join("::"),
         }
     }
 
@@ -199,9 +201,16 @@ impl QualifiedName {
         }
     }
 
-    /// Iterator over segments in the namespace of this type.
+    /// Iterator over segments in the namespace of this name.
     pub(crate) fn ns_segment_iter(&self) -> impl Iterator<Item = &String> {
         self.0.iter()
+    }
+
+    /// Iterate over all segments of this name.
+    pub(crate) fn segment_iter(&self) -> impl Iterator<Item = String> + '_ {
+        self.ns_segment_iter()
+            .cloned()
+            .chain(std::iter::once(self.get_final_item().to_string()))
     }
 
     pub(crate) fn is_cvoid(&self) -> bool {
@@ -219,6 +228,27 @@ impl Display for QualifiedName {
     }
 }
 
+/// cxx doesn't allow identifiers containing __. These are OK elsewhere
+/// in our output mod. It would be nice in future to think of a way we
+/// can enforce this using the Rust type system, e.g. a newtype
+/// wrapper for a CxxCompatibleIdent which is used in any context
+/// where code will be output as part of the `#[cxx::bridge]` mod.
+pub fn validate_ident_ok_for_cxx(id: &str) -> Result<(), ConvertError> {
+    validate_ident_ok_for_rust(id)?;
+    if id.contains("__") {
+        Err(ConvertError::TooManyUnderscores)
+    } else {
+        Ok(())
+    }
+}
+
+pub fn validate_ident_ok_for_rust(id: &str) -> Result<(), ConvertError> {
+    let id = make_ident(id);
+    syn::parse2::<syn::Ident>(id.into_token_stream())
+        .map_err(|_| ConvertError::ReservedName)
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::QualifiedName;
@@ -226,11 +256,11 @@ mod tests {
     #[test]
     fn test_ints() {
         assert_eq!(
-            QualifiedName::new_from_user_input("i8").to_cpp_name(),
+            QualifiedName::new_from_cpp_name("i8").to_cpp_name(),
             "int8_t"
         );
         assert_eq!(
-            QualifiedName::new_from_user_input("u64").to_cpp_name(),
+            QualifiedName::new_from_cpp_name("u64").to_cpp_name(),
             "uint64_t"
         );
     }

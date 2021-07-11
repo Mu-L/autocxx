@@ -159,6 +159,8 @@ fn main() {
                 .help("Extra arguments to pass to Clang"),
         )
         .get_matches();
+
+    env_logger::builder().init();
     let mut parsed_file = parse_file(matches.value_of("INPUT").unwrap())
         .expect("Unable to parse Rust file and interpret autocxx macro");
     let incs = matches
@@ -183,15 +185,17 @@ fn main() {
     if matches.is_present("gen-cpp") {
         let cpp = matches.value_of("cpp-extension").unwrap();
         let mut counter = 0usize;
-        for include_cxx in parsed_file.get_autocxxes() {
+        for include_cxx in parsed_file.get_cpp_buildables() {
             let generations = include_cxx
                 .generate_h_and_cxx()
                 .expect("Unable to generate header and C++ code");
             for pair in generations.0 {
-                let cppname = format!("gen{}.{}", counter, cpp);
-                write_to_file(&outdir, cppname, &pair.implementation);
                 write_to_file(&outdir, pair.header_name, &pair.header);
-                counter += 1;
+                if let Some(implementation) = &pair.implementation {
+                    let cppname = format!("gen{}.{}", counter, cpp);
+                    write_to_file(&outdir, cppname, implementation);
+                    counter += 1;
+                }
             }
         }
         write_placeholders(&outdir, counter, desired_number, cpp);
@@ -206,7 +210,7 @@ fn main() {
         );
     }
     if matches.is_present("gen-rs-include") {
-        let autocxxes = parsed_file.get_autocxxes();
+        let autocxxes = parsed_file.get_rs_buildables();
         let mut counter = 0usize;
         for include_cxx in autocxxes {
             let ts = include_cxx.generate_rs();

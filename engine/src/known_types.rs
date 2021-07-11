@@ -19,7 +19,7 @@ use crate::{
 use indoc::indoc;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
-use syn::{parse_quote, GenericArgument, PathArguments, Type, TypePath, TypePtr};
+use syn::{parse_quote, Type, TypePath, TypePtr};
 
 //// The behavior of the type.
 #[derive(Debug)]
@@ -71,7 +71,7 @@ impl TypeDetails {
             | Behavior::CxxString
             | Behavior::CxxContainerByValueSafe
             | Behavior::CxxContainerNotByValueSafe => {
-                let tn = QualifiedName::new_from_user_input(&self.rs_name);
+                let tn = QualifiedName::new_from_cpp_name(&self.rs_name);
                 let cxx_name = tn.get_final_item();
                 let (templating, payload) = match self.behavior {
                     Behavior::CxxContainerByValueSafe | Behavior::CxxContainerNotByValueSafe => {
@@ -97,14 +97,23 @@ impl TypeDetails {
     }
 
     fn to_type_path(&self) -> TypePath {
-        let segs = self.rs_name.split("::").map(make_ident);
-        parse_quote! {
-            #(#segs)::*
+        let mut segs = self.rs_name.split("::").peekable();
+        if segs.peek().map(|seg| seg.is_empty()).unwrap_or_default() {
+            segs.next();
+            let segs = segs.into_iter().map(make_ident);
+            parse_quote! {
+                ::#(#segs)::*
+            }
+        } else {
+            let segs = segs.into_iter().map(make_ident);
+            parse_quote! {
+                #(#segs)::*
+            }
         }
     }
 
     fn to_typename(&self) -> QualifiedName {
-        QualifiedName::new_from_user_input(&self.rs_name)
+        QualifiedName::new_from_cpp_name(&self.rs_name)
     }
 }
 
@@ -172,8 +181,7 @@ impl TypeDatabase {
     /// Whether this TypePath should be treated as a value in C++
     /// but a reference in Rust. This only applies to rust::Str
     /// (C++ name) which is &str in Rust.
-    pub(crate) fn should_dereference_in_cpp(&self, typ: &TypePath) -> bool {
-        let tn = QualifiedName::from_type_path(typ);
+    pub(crate) fn should_dereference_in_cpp(&self, tn: &QualifiedName) -> bool {
         self.get(&tn)
             .map(|td| matches!(td.behavior, Behavior::RustStr))
             .unwrap_or(false)
@@ -184,26 +192,8 @@ impl TypeDatabase {
     /// We strip off and ignore
     /// any PathArguments within this TypePath - callers should
     /// put them back again if needs be.
-    pub(crate) fn consider_substitution(
-        &self,
-        tn: &QualifiedName,
-    ) -> Result<Option<TypePath>, ConvertError> {
-        match self.get(&tn) {
-            None => {
-                // Only allow types from std:: which we specifically understand,
-                // because we've told bindgen to block all the rest.
-                if tn
-                    .ns_segment_iter()
-                    .next()
-                    .filter(|seg| *seg == "std")
-                    .is_some()
-                {
-                    return Err(ConvertError::UnacceptableStdType(tn.clone()));
-                }
-                Ok(None)
-            }
-            Some(td) => Ok(Some(td.to_type_path())),
-        }
+    pub(crate) fn consider_substitution(&self, tn: &QualifiedName) -> Option<TypePath> {
+        self.get(&tn).map(|td| td.to_type_path())
     }
 
     pub(crate) fn special_cpp_name(&self, rs: &QualifiedName) -> Option<String> {
@@ -216,6 +206,14 @@ impl TypeDatabase {
 
     pub(crate) fn known_type_type_path(&self, ty: &QualifiedName) -> Option<TypePath> {
         self.get(ty).map(|td| td.to_type_path())
+    }
+
+    /// Get the list of types to give to bindgen to ask it _not_ to
+    /// generate code for.
+    pub(crate) fn get_initial_blocklist(&self) -> impl Iterator<Item = &str> + '_ {
+        self.by_rs_name
+            .iter()
+            .filter_map(|(_, td)| td.get_prelude_entry().map(|_| td.cpp_name.as_str()))
     }
 
     /// Whether this is one of the ctypes (mostly variable length integers)
@@ -245,6 +243,15 @@ impl TypeDatabase {
             .unwrap_or(false)
     }
 
+    pub(crate) fn is_cxx_acceptable_receiver(&self, ty: &QualifiedName) -> bool {
+        self.get(ty).is_none() // at present, none of our known types can have
+                               // methods attached.
+    }
+
+    pub(crate) fn conflicts_with_built_in_type(&self, ty: &QualifiedName) -> bool {
+        self.get(ty).is_some()
+    }
+
     pub(crate) fn convertible_from_strs(&self, ty: &QualifiedName) -> bool {
         self.get(ty)
             .map(|x| matches!(x.behavior, Behavior::CxxString))
@@ -255,12 +262,12 @@ impl TypeDatabase {
         let rs_name = td.to_typename();
         if let Some(extra_non_canonical_name) = &td.extra_non_canonical_name {
             self.canonical_names.insert(
-                QualifiedName::new_from_user_input(extra_non_canonical_name),
+                QualifiedName::new_from_cpp_name(extra_non_canonical_name),
                 rs_name.clone(),
             );
         }
         self.canonical_names.insert(
-            QualifiedName::new_from_user_input(&td.cpp_name),
+            QualifiedName::new_from_cpp_name(&td.cpp_name),
             rs_name.clone(),
         );
         self.by_rs_name.insert(rs_name, td);
@@ -284,6 +291,12 @@ fn create_type_database() -> TypeDatabase {
     db.insert(TypeDetails::new(
         "cxx::SharedPtr",
         "std::shared_ptr",
+        Behavior::CxxContainerByValueSafe,
+        None,
+    ));
+    db.insert(TypeDetails::new(
+        "cxx::WeakPtr",
+        "std::weak_ptr",
         Behavior::CxxContainerByValueSafe,
         None,
     ));
@@ -367,7 +380,7 @@ fn create_type_database() -> TypeDatabase {
     db.insert(TypeDetails::new("f32", "float", Behavior::CByValue, None));
     db.insert(TypeDetails::new("f64", "double", Behavior::CByValue, None));
     db.insert(TypeDetails::new(
-        "std::os::raw::c_char",
+        "::std::os::raw::c_char",
         "char",
         Behavior::CByValue,
         None,
@@ -381,21 +394,6 @@ fn create_type_database() -> TypeDatabase {
     db
 }
 
-/// This is worked out basically using trial and error.
-/// Excluding std* and rust* is obvious, but the other items...
-/// in theory bindgen ought to be smart enough to work out that
-/// they're not used and therefore not generate code for them.
-/// But it doesm unless we blocklist them. This is obviously
-/// a bit sensitive to the particular STL in use so one day
-/// it would be good to dig into bindgen's behavior here - TODO.
-const BINDGEN_BLOCKLIST: &[&str] = &["std::.*", "__gnu.*", ".*mbstate_t.*", "rust::.*"];
-
-/// Get the list of types to give to bindgen to ask it _not_ to
-/// generate code for.
-pub(crate) fn get_initial_blocklist() -> Vec<String> {
-    BINDGEN_BLOCKLIST.iter().map(|s| s.to_string()).collect()
-}
-
 /// If a given type lacks a copy constructor, we should always use
 /// std::move in wrapper functions.
 pub(crate) fn type_lacks_copy_constructor(ty: &Type) -> bool {
@@ -406,40 +404,6 @@ pub(crate) fn type_lacks_copy_constructor(ty: &Type) -> bool {
             tn.to_cpp_name().starts_with("std::unique_ptr")
         }
         _ => false,
-    }
-}
-
-pub(crate) fn confirm_inner_type_is_acceptable_generic_payload(
-    path_args: &PathArguments,
-    desc: &QualifiedName,
-) -> Result<(), ConvertError> {
-    // For now, all supported generics accept the same payloads. This
-    // may change in future in which case we'll need to accept more arguments here.
-    match path_args {
-        PathArguments::None => Ok(()),
-        PathArguments::Parenthesized(_) => Err(ConvertError::TemplatedTypeContainingNonPathArg(
-            desc.clone(),
-        )),
-        PathArguments::AngleBracketed(ab) => {
-            for inner in &ab.args {
-                match inner {
-                    GenericArgument::Type(Type::Path(typ)) => {
-                        if let Some(more_generics) = typ.path.segments.last() {
-                            confirm_inner_type_is_acceptable_generic_payload(
-                                &more_generics.arguments,
-                                desc,
-                            )?;
-                        }
-                    }
-                    _ => {
-                        return Err(ConvertError::TemplatedTypeContainingNonPathArg(
-                            desc.clone(),
-                        ))
-                    }
-                }
-            }
-            Ok(())
-        }
     }
 }
 

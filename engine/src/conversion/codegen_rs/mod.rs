@@ -22,6 +22,7 @@ mod unqualify;
 
 use std::collections::HashMap;
 
+use autocxx_parser::IncludeCppConfig;
 // The following should not need to be exposed outside
 // codegen_rs but currently Rust codegen happens everywhere... TODO
 pub(crate) use non_pod_struct::make_non_pod;
@@ -29,7 +30,10 @@ pub(crate) use non_pod_struct::make_non_pod;
 use proc_macro2::TokenStream;
 use syn::{parse_quote, ForeignItem, Ident, Item, ItemForeignMod, ItemMod};
 
-use crate::types::{make_ident, Namespace, QualifiedName};
+use crate::{
+    known_types::known_types,
+    types::{make_ident, Namespace, QualifiedName},
+};
 use impl_item_creator::create_impl_items;
 
 use self::{
@@ -38,16 +42,19 @@ use self::{
     non_pod_struct::new_non_pod_struct,
 };
 
+use super::codegen_cpp::type_to_cpp::{
+    namespaced_name_using_original_name_map, original_name_map_from_apis, CppNameMap,
+};
 use super::{
     analysis::fun::FnAnalysis,
-    api::{Api, ApiAnalysis, ApiDetail, ImplBlockDetails, TypeKind, TypedefKind},
+    api::{AnalysisPhase, Api, ImplBlockDetails, TypeKind, TypedefKind},
 };
 use super::{convert_error::ErrorContext, ConvertError};
 use quote::quote;
 
 unzip_n::unzip_n!(pub 3);
 
-/// Whether and how this type should be exposed in the mods constructed
+/// Whether and how this item should be exposed in the mods constructed
 /// for actual end-user use.
 #[derive(Clone)]
 enum Use {
@@ -76,21 +83,21 @@ fn get_string_items() -> Vec<Item> {
         Item::Impl(parse_quote! {
             impl ToCppString for &str {
                 fn into_cpp(self) -> cxx::UniquePtr<cxx::CxxString> {
-                    cxxbridge::make_string(self)
+                    make_string(self)
                 }
             }
         }),
         Item::Impl(parse_quote! {
             impl ToCppString for String {
                 fn into_cpp(self) -> cxx::UniquePtr<cxx::CxxString> {
-                    cxxbridge::make_string(&self)
+                    make_string(&self)
                 }
             }
         }),
         Item::Impl(parse_quote! {
             impl ToCppString for &String {
                 fn into_cpp(self) -> cxx::UniquePtr<cxx::CxxString> {
-                    cxxbridge::make_string(self)
+                    make_string(self)
                 }
             }
         }),
@@ -115,6 +122,8 @@ fn remove_nones<T>(input: Vec<Option<T>>) -> Vec<T> {
 pub(crate) struct RsCodeGenerator<'a> {
     include_list: &'a [String],
     bindgen_mod: ItemMod,
+    original_name_map: CppNameMap,
+    config: &'a IncludeCppConfig,
 }
 
 impl<'a> RsCodeGenerator<'a> {
@@ -123,28 +132,27 @@ impl<'a> RsCodeGenerator<'a> {
         all_apis: Vec<Api<FnAnalysis>>,
         include_list: &'a [String],
         bindgen_mod: ItemMod,
+        config: &'a IncludeCppConfig,
     ) -> Vec<Item> {
         let c = Self {
             include_list,
             bindgen_mod,
+            original_name_map: original_name_map_from_apis(&all_apis),
+            config,
         };
         c.rs_codegen(all_apis)
     }
 
     fn rs_codegen(mut self, all_apis: Vec<Api<FnAnalysis>>) -> Vec<Item> {
         // ... and now let's start to generate the output code.
-        // First let's see if we plan to generate the string construction utilities, as this will affect
-        // what 'use' statements we need here and there.
-        let generate_utilities = all_apis
-            .iter()
-            .any(|api| matches!(&api.detail, ApiDetail::StringConstructor));
         // Now let's generate the Rust code.
         let (rs_codegen_results_and_namespaces, additional_cpp_needs): (Vec<_>, Vec<_>) = all_apis
             .into_iter()
             .map(|api| {
                 let more_cpp_needed = api.additional_cpp().is_some();
-                let gen = Self::generate_rs_for_api(&api.name, api.detail);
-                ((api.name, gen), more_cpp_needed)
+                let name = api.name().clone();
+                let gen = self.generate_rs_for_api(api);
+                ((name, gen), more_cpp_needed)
             })
             .unzip();
         // First, the hierarchy of mods containing lots of 'use' statements
@@ -152,8 +160,8 @@ impl<'a> RsCodeGenerator<'a> {
         let mut use_statements =
             Self::generate_final_use_statements(&rs_codegen_results_and_namespaces);
         // And work out what we need for the bindgen mod.
-        let bindgen_root_items = self
-            .generate_final_bindgen_mods(&rs_codegen_results_and_namespaces, generate_utilities);
+        let bindgen_root_items =
+            self.generate_final_bindgen_mods(&rs_codegen_results_and_namespaces);
         // Both of the above ('use' hierarchy and bindgen mod) are organized into
         // sub-mods by namespace. From here on, things are flat.
         let (_, rs_codegen_results): (Vec<_>, Vec<_>) =
@@ -217,7 +225,10 @@ impl<'a> RsCodeGenerator<'a> {
 
     fn build_include_foreign_items(&self, has_additional_cpp_needs: bool) -> Vec<ForeignItem> {
         let extra_inclusion = if has_additional_cpp_needs {
-            Some("autocxxgen.h".to_string())
+            Some(format!(
+                "autocxxgen_{}.h",
+                self.config.get_mod_name().to_string()
+            ))
         } else {
             None
         };
@@ -276,12 +287,7 @@ impl<'a> RsCodeGenerator<'a> {
         }
     }
 
-    fn append_uses_for_ns(
-        &mut self,
-        items: &mut Vec<Item>,
-        ns: &Namespace,
-        generate_utilities: bool,
-    ) {
+    fn append_uses_for_ns(&mut self, items: &mut Vec<Item>, ns: &Namespace) {
         let super_duper = std::iter::repeat(make_ident("super")); // I'll get my coat
         let supers = super_duper.clone().take(ns.depth() + 2);
         items.push(Item::Use(parse_quote! {
@@ -290,7 +296,7 @@ impl<'a> RsCodeGenerator<'a> {
                 #(#supers)::*
             ::cxxbridge;
         }));
-        if generate_utilities {
+        if !self.config.exclude_utilities() {
             let supers = super_duper.clone().take(ns.depth() + 2);
             items.push(Item::Use(parse_quote! {
                 #[allow(unused_imports)]
@@ -313,7 +319,6 @@ impl<'a> RsCodeGenerator<'a> {
         ns_entries: &NamespaceEntries<(QualifiedName, RsCodegenResult)>,
         output_items: &mut Vec<Item>,
         ns: &Namespace,
-        generate_utilities: bool,
     ) {
         let mut impl_entries_by_type: HashMap<_, Vec<_>> = HashMap::new();
         for item in ns_entries.entries() {
@@ -337,18 +342,13 @@ impl<'a> RsCodeGenerator<'a> {
             let child_id = make_ident(child_name);
 
             let mut inner_output_items = Vec::new();
-            self.append_child_bindgen_namespace(
-                child_ns_entries,
-                &mut inner_output_items,
-                &new_ns,
-                generate_utilities,
-            );
+            self.append_child_bindgen_namespace(child_ns_entries, &mut inner_output_items, &new_ns);
             if !inner_output_items.is_empty() {
                 let mut new_mod: ItemMod = parse_quote!(
                     pub mod #child_id {
                     }
                 );
-                self.append_uses_for_ns(&mut inner_output_items, &new_ns, generate_utilities);
+                self.append_uses_for_ns(&mut inner_output_items, &new_ns);
                 new_mod.content.as_mut().unwrap().1 = inner_output_items;
                 output_items.push(Item::Mod(new_mod));
             }
@@ -358,89 +358,78 @@ impl<'a> RsCodeGenerator<'a> {
     fn generate_final_bindgen_mods(
         &mut self,
         input_items: &[(QualifiedName, RsCodegenResult)],
-        generate_utilities: bool,
     ) -> Vec<Item> {
         let mut output_items = Vec::new();
         let ns = Namespace::new();
         let ns_entries = NamespaceEntries::new(input_items);
-        self.append_child_bindgen_namespace(
-            &ns_entries,
-            &mut output_items,
-            &ns,
-            generate_utilities,
-        );
-        self.append_uses_for_ns(&mut output_items, &ns, generate_utilities);
+        self.append_child_bindgen_namespace(&ns_entries, &mut output_items, &ns);
+        self.append_uses_for_ns(&mut output_items, &ns);
         output_items
     }
 
-    fn generate_rs_for_api(
-        name: &QualifiedName,
-        api_detail: ApiDetail<FnAnalysis>,
-    ) -> RsCodegenResult {
+    fn generate_rs_for_api(&self, api: Api<FnAnalysis>) -> RsCodegenResult {
+        let name = api.name().clone();
         let id = name.get_final_ident();
-        match api_detail {
-            ApiDetail::StringConstructor => RsCodegenResult {
-                extern_c_mod_item: Some(ForeignItem::Fn(parse_quote!(
-                    fn make_string(str_: &str) -> UniquePtr<CxxString>;
-                ))),
-                bridge_items: Vec::new(),
-                global_items: get_string_items(),
-                bindgen_mod_item: None,
+        let cpp_call_name = api.effective_cpp_name().to_string();
+        match api {
+            Api::StringConstructor { .. } => {
+                let make_string_name = make_ident(self.config.get_makestring_name());
+                RsCodegenResult {
+                    extern_c_mod_item: Some(ForeignItem::Fn(parse_quote!(
+                        fn #make_string_name(str_: &str) -> UniquePtr<CxxString>;
+                    ))),
+                    bridge_items: Vec::new(),
+                    global_items: get_string_items(),
+                    bindgen_mod_item: None,
+                    impl_entry: None,
+                    materialization: Use::UsedFromCxxBridgeWithAlias(make_ident("make_string")),
+                }
+            }
+            Api::ConcreteType { .. } => RsCodegenResult {
+                global_items: self.generate_extern_type_impl(TypeKind::NonPod, &name),
+                bridge_items: create_impl_items(&id, self.config),
+                extern_c_mod_item: Some(ForeignItem::Verbatim(self.generate_cxxbridge_type(&name))),
+                bindgen_mod_item: Some(Item::Struct(new_non_pod_struct(id.clone()))),
                 impl_entry: None,
                 materialization: Use::Unused,
             },
-            ApiDetail::ConcreteType { .. } => {
-                let global_items = Self::generate_extern_type_impl(TypeKind::NonPod, &name);
-                RsCodegenResult {
-                    global_items,
-                    bridge_items: create_impl_items(&id),
-                    extern_c_mod_item: Some(ForeignItem::Verbatim(quote! {
-                        type #id = super::bindgen::root::#id;
-                    })),
-                    bindgen_mod_item: Some(Item::Struct(new_non_pod_struct(id.clone()))),
-                    impl_entry: None,
-                    materialization: Use::Unused,
-                }
+            Api::ForwardDeclaration { .. } => RsCodegenResult {
+                extern_c_mod_item: Some(ForeignItem::Verbatim(self.generate_cxxbridge_type(&name))),
+                bridge_items: Vec::new(),
+                global_items: self.generate_extern_type_impl(TypeKind::NonPod, &name),
+                bindgen_mod_item: Some(Item::Struct(new_non_pod_struct(id))),
+                impl_entry: None,
+                materialization: Use::UsedFromCxxBridge,
+            },
+            Api::Function { fun, analysis, .. } => {
+                gen_function(name.get_namespace(), *fun, analysis, cpp_call_name)
             }
-            ApiDetail::Function { fun, analysis } => {
-                gen_function(name.get_namespace(), fun, analysis)
-            }
-            ApiDetail::Const { const_item } => RsCodegenResult {
-                global_items: vec![Item::Const(const_item)],
+            Api::Const { const_item, .. } => RsCodegenResult {
+                global_items: Vec::new(),
                 impl_entry: None,
                 bridge_items: Vec::new(),
                 extern_c_mod_item: None,
-                bindgen_mod_item: None,
-                materialization: Use::Unused,
+                bindgen_mod_item: Some(Item::Const(const_item)),
+                materialization: Use::UsedFromBindgen,
             },
-            ApiDetail::Typedef { payload } => RsCodegenResult {
+            Api::Typedef { analysis, .. } => RsCodegenResult {
                 extern_c_mod_item: None,
                 bridge_items: Vec::new(),
                 global_items: Vec::new(),
-                bindgen_mod_item: Some(match payload {
+                bindgen_mod_item: Some(match analysis.kind {
                     TypedefKind::Type(type_item) => Item::Type(type_item),
                     TypedefKind::Use(use_item) => Item::Use(use_item),
                 }),
                 impl_entry: None,
                 materialization: Use::UsedFromBindgen,
             },
-            ApiDetail::Type {
-                is_forward_declaration: _,
-                bindgen_mod_item,
-                analysis,
-            } => RsCodegenResult {
-                global_items: Self::generate_extern_type_impl(analysis, &name),
-                impl_entry: None,
-                bridge_items: if analysis.can_be_instantiated() {
-                    create_impl_items(&id)
-                } else {
-                    Vec::new()
-                },
-                extern_c_mod_item: Some(ForeignItem::Verbatim(Self::generate_cxxbridge_type(name))),
-                bindgen_mod_item,
-                materialization: Use::UsedFromCxxBridge,
-            },
-            ApiDetail::CType { .. } => RsCodegenResult {
+            Api::Struct { item, analysis, .. } => {
+                self.generate_type(&name, id, item, analysis.kind, Item::Struct)
+            }
+            Api::Enum { item, .. } => {
+                self.generate_type(&name, id, item, TypeKind::Pod, Item::Enum)
+            }
+            Api::CType { .. } => RsCodegenResult {
                 global_items: Vec::new(),
                 impl_entry: None,
                 bridge_items: Vec::new(),
@@ -450,17 +439,32 @@ impl<'a> RsCodeGenerator<'a> {
                 bindgen_mod_item: None,
                 materialization: Use::Unused,
             },
-            ApiDetail::OpaqueTypedef => RsCodegenResult {
-                global_items: Vec::new(),
-                impl_entry: None,
-                bridge_items: create_impl_items(&id),
-                extern_c_mod_item: Some(ForeignItem::Type(parse_quote! {
-                    type #id;
-                })),
-                bindgen_mod_item: None,
-                materialization: Use::Unused,
+            Api::IgnoredItem { err, ctx, .. } => Self::generate_error_entry(err, ctx),
+        }
+    }
+
+    fn generate_type<T, F>(
+        &self,
+        name: &QualifiedName,
+        id: Ident,
+        item: T,
+        analysis: TypeKind,
+        item_type: F,
+    ) -> RsCodegenResult
+    where
+        F: FnOnce(T) -> Item,
+    {
+        RsCodegenResult {
+            global_items: self.generate_extern_type_impl(analysis, &name),
+            impl_entry: None,
+            bridge_items: if analysis.can_be_instantiated() {
+                create_impl_items(&id, self.config)
+            } else {
+                Vec::new()
             },
-            ApiDetail::IgnoredItem { err, ctx } => Self::generate_error_entry(err, ctx),
+            extern_c_mod_item: Some(ForeignItem::Verbatim(self.generate_cxxbridge_type(name))),
+            bindgen_mod_item: Some(item_type(item)),
+            materialization: Use::UsedFromCxxBridge,
         }
     }
 
@@ -470,24 +474,50 @@ impl<'a> RsCodeGenerator<'a> {
     fn generate_error_entry(err: ConvertError, ctx: ErrorContext) -> RsCodegenResult {
         let err = format!("autocxx bindings couldn't be generated: {}", err);
         let (impl_entry, materialization) = match ctx {
-            ErrorContext::Item(id) => (
-                None,
-                Use::Custom(Box::new(parse_quote! {
-                    #[doc = #err]
-                    pub struct #id;
-                })),
-            ),
-            ErrorContext::Method { self_ty, method } => (
-                Some(Box::new(ImplBlockDetails {
-                    item: parse_quote! {
+            ErrorContext::Item(id) => {
+                let id = Self::sanitize_error_ident(&id).unwrap_or(id);
+                (
+                    None,
+                    Use::Custom(Box::new(parse_quote! {
                         #[doc = #err]
-                        fn #method(_uhoh: autocxx::BindingGenerationFailure) {
-                        }
-                    },
-                    ty: self_ty,
-                })),
-                Use::Unused,
-            ),
+                        pub struct #id;
+                    })),
+                )
+            }
+            ErrorContext::Method { self_ty, method }
+                if Self::sanitize_error_ident(&self_ty).is_none() =>
+            {
+                // This could go wrong if a separate error has caused
+                // us to drop an entire type as well as one of its individual items.
+                // Then we'll be applying an impl to a thing which doesn't exist. TODO.
+                let method = Self::sanitize_error_ident(&method).unwrap_or(method);
+                (
+                    Some(Box::new(ImplBlockDetails {
+                        item: parse_quote! {
+                            #[doc = #err]
+                            fn #method(_uhoh: autocxx::BindingGenerationFailure) {
+                            }
+                        },
+                        ty: self_ty,
+                    })),
+                    Use::Unused,
+                )
+            }
+            ErrorContext::Method { self_ty, method } => {
+                // If the type can't be represented (e.g. u8) this would get fiddly.
+                let id = make_ident(format!(
+                    "{}_method_{}",
+                    self_ty.to_string(),
+                    method.to_string()
+                ));
+                (
+                    None,
+                    Use::Custom(Box::new(parse_quote! {
+                        #[doc = #err]
+                        pub struct #id;
+                    })),
+                )
+            }
         };
         RsCodegenResult {
             global_items: Vec::new(),
@@ -496,6 +526,17 @@ impl<'a> RsCodeGenerator<'a> {
             extern_c_mod_item: None,
             bindgen_mod_item: None,
             materialization,
+        }
+    }
+
+    /// Because errors may be generated for invalid types or identifiers,
+    /// we may need to scrub the name
+    fn sanitize_error_ident(id: &Ident) -> Option<Ident> {
+        let qn = QualifiedName::new(&Namespace::new(), id.clone());
+        if known_types().conflicts_with_built_in_type(&qn) {
+            Some(make_ident(format!("{}_autocxx_error", qn.get_final_item())))
+        } else {
+            None
         }
     }
 
@@ -521,8 +562,8 @@ impl<'a> RsCodeGenerator<'a> {
         })
     }
 
-    fn generate_extern_type_impl(type_kind: TypeKind, tyname: &QualifiedName) -> Vec<Item> {
-        let tynamestring = tyname.to_cpp_name();
+    fn generate_extern_type_impl(&self, type_kind: TypeKind, tyname: &QualifiedName) -> Vec<Item> {
+        let tynamestring = namespaced_name_using_original_name_map(tyname, &self.original_name_map);
         let fulltypath = tyname.get_bindgen_path_idents();
         let kind_item = match type_kind {
             TypeKind::Pod => "Trivial",
@@ -537,17 +578,31 @@ impl<'a> RsCodeGenerator<'a> {
         })]
     }
 
-    fn generate_cxxbridge_type(name: &QualifiedName) -> TokenStream {
-        let id = name.get_final_ident();
+    fn generate_cxxbridge_type(&self, name: &QualifiedName) -> TokenStream {
         let ns = name.get_namespace();
-        let mut for_extern_c_ts = if !ns.is_empty() {
-            let ns_string = ns.iter().cloned().collect::<Vec<String>>().join("::");
+        let id = name.get_final_ident();
+        let mut ns_components: Vec<_> = ns.iter().cloned().collect();
+        let mut cxx_name = None;
+        if let Some(cpp_name) = self.original_name_map.get(name) {
+            let cpp_name = QualifiedName::new_from_cpp_name(cpp_name);
+            cxx_name = Some(cpp_name.get_final_item().to_string());
+            ns_components.extend(cpp_name.ns_segment_iter().cloned());
+        };
+
+        let mut for_extern_c_ts = if !ns_components.is_empty() {
+            let ns_string = ns_components.join("::");
             quote! {
                 #[namespace = #ns_string]
             }
         } else {
             TokenStream::new()
         };
+
+        if let Some(n) = cxx_name {
+            for_extern_c_ts.extend(quote! {
+                #[cxx_name = #n]
+            });
+        }
 
         for_extern_c_ts.extend(quote! {
             type #id = super::bindgen::root::
@@ -574,9 +629,9 @@ impl HasNs for (QualifiedName, RsCodegenResult) {
     }
 }
 
-impl<T: ApiAnalysis> HasNs for Api<T> {
+impl<T: AnalysisPhase> HasNs for Api<T> {
     fn get_namespace(&self) -> &Namespace {
-        &self.name.get_namespace()
+        &self.name().get_namespace()
     }
 }
 

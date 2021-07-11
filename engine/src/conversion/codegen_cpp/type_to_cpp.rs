@@ -12,24 +12,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{conversion::ConvertError, types::QualifiedName};
+use crate::{
+    conversion::{api::Api, AnalysisPhase, ConvertError},
+    types::QualifiedName,
+};
+use itertools::Itertools;
 use quote::ToTokens;
+use std::collections::HashMap;
+use std::iter::once;
 use syn::{Token, Type};
 
-pub(crate) fn type_to_cpp(ty: &Type) -> Result<String, ConvertError> {
+/// Map from QualifiedName to original C++ name. Original C++ name does not
+/// include the namespace; this can be assumed to be the same as the namespace
+/// in the QualifiedName.
+pub(crate) type CppNameMap = HashMap<QualifiedName, String>;
+
+pub(crate) fn original_name_map_from_apis<T: AnalysisPhase>(apis: &[Api<T>]) -> CppNameMap {
+    apis.iter()
+        .filter_map(|api| {
+            api.cpp_name()
+                .as_ref()
+                .map(|cpp_name| (api.name().clone(), cpp_name.clone()))
+        })
+        .collect()
+}
+
+pub(crate) fn namespaced_name_using_original_name_map(
+    qual_name: &QualifiedName,
+    original_name_map: &CppNameMap,
+) -> String {
+    if let Some(cpp_name) = original_name_map.get(&qual_name) {
+        qual_name
+            .get_namespace()
+            .iter()
+            .chain(once(cpp_name))
+            .join("::")
+    } else {
+        qual_name.to_cpp_name()
+    }
+}
+
+pub(crate) fn type_to_cpp(ty: &Type, cpp_name_map: &CppNameMap) -> Result<String, ConvertError> {
     match ty {
         Type::Path(typ) => {
             // If this is a std::unique_ptr we do need to pass
             // its argument through.
-            let root = QualifiedName::from_type_path(typ);
-            let root = root.to_cpp_name();
+            let qual_name = QualifiedName::from_type_path(typ);
+            let root = namespaced_name_using_original_name_map(&qual_name, cpp_name_map);
             if root == "Pin" {
                 // Strip all Pins from type names when describing them in C++.
                 let inner_type = &typ.path.segments.last().unwrap().arguments;
                 if let syn::PathArguments::AngleBracketed(ab) = inner_type {
                     let inner_type = ab.args.iter().next().unwrap();
                     if let syn::GenericArgument::Type(gat) = inner_type {
-                        return type_to_cpp(gat);
+                        return type_to_cpp(gat, cpp_name_map);
                     }
                 }
                 panic!("Pin<...> didn't contain the inner types we expected");
@@ -40,7 +76,7 @@ pub(crate) fn type_to_cpp(ty: &Type) -> Result<String, ConvertError> {
                         .args
                         .iter()
                         .map(|x| match x {
-                            syn::GenericArgument::Type(gat) => type_to_cpp(gat),
+                            syn::GenericArgument::Type(gat) => type_to_cpp(gat, cpp_name_map),
                             _ => Ok("".to_string()),
                         })
                         .collect();
@@ -56,12 +92,12 @@ pub(crate) fn type_to_cpp(ty: &Type) -> Result<String, ConvertError> {
         Type::Reference(typr) => Ok(format!(
             "{}{}&",
             get_mut_string(&typr.mutability),
-            type_to_cpp(typr.elem.as_ref())?
+            type_to_cpp(typr.elem.as_ref(), cpp_name_map)?
         )),
         Type::Ptr(typp) => Ok(format!(
             "{}{}*",
             get_mut_string(&typp.mutability),
-            type_to_cpp(typp.elem.as_ref())?
+            type_to_cpp(typp.elem.as_ref(), cpp_name_map)?
         )),
         Type::Array(_)
         | Type::BareFn(_)

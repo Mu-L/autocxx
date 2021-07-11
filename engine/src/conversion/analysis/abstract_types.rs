@@ -12,38 +12,85 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::fun::{FnAnalysis, FnAnalysisBody, FnKind, MethodKind};
-use crate::conversion::api::ApiDetail;
-use crate::conversion::api::{Api, TypeKind};
+use autocxx_parser::IncludeCppConfig;
+
+use super::{
+    fun::{FnAnalysis, FnAnalysisBody, FnKind, MethodKind},
+    pod::PodStructAnalysisBody,
+};
+use crate::conversion::api::TypeKind;
+use crate::{conversion::api::Api, types::QualifiedName};
 use std::collections::HashSet;
 
 /// Spot types with pure virtual functions and mark them abstract.
-pub(crate) fn mark_types_abstract(apis: &mut Vec<Api<FnAnalysis>>) {
-    let abstract_types: HashSet<_> = apis
+pub(crate) fn mark_types_abstract(config: &IncludeCppConfig, apis: &mut Vec<Api<FnAnalysis>>) {
+    let mut abstract_types: HashSet<_> = apis
         .iter()
-        .filter_map(|api| match &api.detail {
-            ApiDetail::Function {
-                fun: _,
+        .filter_map(|api| match &api {
+            Api::Function {
                 analysis:
                     FnAnalysisBody {
                         kind: FnKind::Method(self_ty_name, MethodKind::PureVirtual),
                         ..
                     },
+                ..
             } => Some(self_ty_name.clone()),
             _ => None,
         })
         .collect();
-    if abstract_types.is_empty() {
-        return;
-    }
 
-    for api in apis {
-        let tyname = api.typename();
-        match &mut api.detail {
-            ApiDetail::Type { analysis, .. } if abstract_types.contains(&tyname) => {
-                *analysis = TypeKind::Abstract;
+    for mut api in apis.iter_mut() {
+        match &mut api {
+            Api::Struct { analysis, name, .. } if abstract_types.contains(&name.name) => {
+                analysis.kind = TypeKind::Abstract;
             }
             _ => {}
         }
     }
+
+    // Spot any derived classes (recursively). Also, any types which have a base
+    // class that's not on the allowlist are presumed to be abstract, because we
+    // have no way of knowing (as they're not on the allowlist, there will be
+    // no methods associated so we won't be able to spot pure virtual methods).
+    let mut iterate = true;
+    while iterate {
+        iterate = false;
+        for mut api in apis.iter_mut() {
+            match &mut api {
+                Api::Struct {
+                    analysis: PodStructAnalysisBody { bases, kind, .. },
+                    ..
+                } if *kind != TypeKind::Abstract
+                    && (!abstract_types.is_disjoint(bases)
+                        || any_missing_from_allowlist(config, &bases)) =>
+                {
+                    *kind = TypeKind::Abstract;
+                    abstract_types.insert(api.name().clone());
+                    // Recurse in case there are further dependent types
+                    iterate = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // We also need to remove any constructors belonging to these
+    // abstract types.
+    apis.retain(|api| {
+        !matches!(&api,
+        Api::Function {
+            analysis:
+                FnAnalysisBody {
+                    kind: FnKind::Method(self_ty, MethodKind::Constructor),
+                    ..
+                },
+                ..
+        } if abstract_types.contains(&self_ty))
+    })
+}
+
+fn any_missing_from_allowlist(config: &IncludeCppConfig, bases: &HashSet<QualifiedName>) -> bool {
+    bases
+        .iter()
+        .any(|qn| !config.is_on_allowlist(&qn.to_cpp_name()))
 }

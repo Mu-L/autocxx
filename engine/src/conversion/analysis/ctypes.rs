@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use syn::Ident;
 
+use crate::conversion::api::ApiName;
+use crate::types::Namespace;
 use crate::{conversion::api::Api, known_types::known_types, types::QualifiedName};
-use crate::{conversion::api::ApiDetail, types::Namespace};
 
 use super::fun::FnAnalysis;
 
@@ -26,16 +27,15 @@ use super::fun::FnAnalysis;
 pub(crate) fn append_ctype_information(apis: &mut Vec<Api<FnAnalysis>>) {
     let ctypes: HashMap<Ident, QualifiedName> = apis
         .iter()
-        .map(|api| api.deps.iter())
+        .map(|api| api.deps())
         .flatten()
         .filter(|ty| known_types().is_ctype(ty))
         .map(|ty| (ty.get_final_ident(), ty.clone()))
         .collect();
-    for (id, tn) in ctypes {
-        apis.push(Api {
-            name: QualifiedName::new(&Namespace::new(), id),
-            deps: HashSet::new(),
-            detail: ApiDetail::CType { typename: tn },
+    for (id, typename) in ctypes {
+        apis.push(Api::CType {
+            name: ApiName::new(&Namespace::new(), id),
+            typename,
         });
     }
 }

@@ -12,20 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    conversion::api::TypedefKind,
-    types::{Namespace, QualifiedName},
-};
+use crate::{conversion::ConvertError, known_types::known_types};
 use crate::{
     conversion::{
-        api::{ApiDetail, UnanalyzedApi},
-        ConvertError,
+        analysis::tdef::TypedefAnalysis,
+        api::{Api, TypedefKind},
     },
-    known_types::known_types,
+    types::{Namespace, QualifiedName},
 };
-use autocxx_parser::TypeConfig;
+use autocxx_parser::IncludeCppConfig;
 use std::collections::HashMap;
-use syn::{Item, ItemStruct, Type};
+use syn::{ItemStruct, Type};
 
 #[derive(Clone)]
 enum PodState {
@@ -78,26 +75,26 @@ impl ByValueChecker {
     /// Scan APIs to work out which are by-value safe. Constructs a [ByValueChecker]
     /// that others can use to query the results.
     pub(crate) fn new_from_apis(
-        apis: &[UnanalyzedApi],
-        type_config: &TypeConfig,
+        apis: &[Api<TypedefAnalysis>],
+        config: &IncludeCppConfig,
     ) -> Result<ByValueChecker, ConvertError> {
         let mut byvalue_checker = ByValueChecker::new();
-        for blocklisted in type_config.get_blocklist() {
-            let tn = QualifiedName::new_from_user_input(blocklisted);
+        for blocklisted in config.get_blocklist() {
+            let tn = QualifiedName::new_from_cpp_name(blocklisted);
             let safety = PodState::UnsafeToBePod(format!("type {} is on the blocklist", &tn));
             byvalue_checker
                 .results
                 .insert(tn, StructDetails::new(safety));
         }
         for api in apis {
-            match &api.detail {
-                ApiDetail::Typedef { payload } => {
-                    let name = api.typename();
-                    let typedef_type = match payload {
-                        TypedefKind::Type(type_item) => match type_item.ty.as_ref() {
+            match &api {
+                Api::Typedef { analysis, .. } => {
+                    let name = api.name();
+                    let typedef_type = match analysis.kind {
+                        TypedefKind::Type(ref type_item) => match type_item.ty.as_ref() {
                             Type::Path(typ) => {
                                 let target_tn = QualifiedName::from_type_path(&typ);
-                                known_types().consider_substitution(&target_tn)?
+                                known_types().consider_substitution(&target_tn)
                             }
                             _ => None,
                         },
@@ -106,39 +103,30 @@ impl ByValueChecker {
                     match &typedef_type {
                         Some(typ) => {
                             byvalue_checker.results.insert(
-                                name,
+                                name.clone(),
                                 StructDetails::new(PodState::IsAlias(
                                     QualifiedName::from_type_path(typ),
                                 )),
                             );
                         }
-                        None => byvalue_checker.ingest_nonpod_type(name),
+                        None => byvalue_checker.ingest_nonpod_type(name.clone()),
                     }
                 }
-                ApiDetail::Type {
-                    is_forward_declaration: _,
-                    bindgen_mod_item,
-                    analysis: _,
-                } => match bindgen_mod_item {
-                    None => {}
-                    Some(Item::Struct(s)) => {
-                        byvalue_checker.ingest_struct(&s, &api.name.get_namespace())
-                    }
-                    Some(Item::Enum(_)) => {
-                        byvalue_checker
-                            .results
-                            .insert(api.typename(), StructDetails::new(PodState::IsPod));
-                    }
-                    _ => {}
-                },
-                ApiDetail::OpaqueTypedef => byvalue_checker.ingest_nonpod_type(api.typename()),
+                Api::Struct { item, .. } => {
+                    byvalue_checker.ingest_struct(&item, &api.name().get_namespace())
+                }
+                Api::Enum { .. } => {
+                    byvalue_checker
+                        .results
+                        .insert(api.name().clone(), StructDetails::new(PodState::IsPod));
+                }
                 _ => {}
             }
         }
-        let pod_requests = type_config
+        let pod_requests = config
             .get_pod_requests()
             .iter()
-            .map(|ty| QualifiedName::new_from_user_input(ty))
+            .map(|ty| QualifiedName::new_from_cpp_name(ty))
             .collect();
         byvalue_checker
             .satisfy_requests(pod_requests)
@@ -271,13 +259,13 @@ mod tests {
     use syn::{parse_quote, Ident, ItemStruct};
 
     fn ty_from_ident(id: &Ident) -> QualifiedName {
-        QualifiedName::new_from_user_input(&id.to_string())
+        QualifiedName::new_from_cpp_name(&id.to_string())
     }
 
     #[test]
     fn test_primitive_by_itself() {
         let bvc = ByValueChecker::new();
-        let t_id = QualifiedName::new_from_user_input("u32");
+        let t_id = QualifiedName::new_from_cpp_name("u32");
         assert!(bvc.is_pod(&t_id));
     }
 

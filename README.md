@@ -10,27 +10,19 @@ The intention is that it has all the fluent safety from [cxx](https://github.com
 
 # Overview
 
-```cpp
-namespace base {
-  class Bob {
-  public:
-      Bob(std::string name);
-      ...
-      void do_a_thing() const;
-  };
-}
-```
-
 ```rust
-use autocxx::include_cpp;
-
-include_cpp!{
-    #include "base/bob.h"
-    generate!("Bob")
+autocxx::include_cpp! {
+    #include "url/origin.h"
+    generate!("url::Origin")
+    safety!(unsafe_ffi)
 }
 
-let a = ffi::base::Bob::make_unique("hello");
-a.do_a_thing();
+fn main() {
+    let o = ffi::url::Origin::CreateFromNormalizedTuple("https",
+        "google.com", 443);
+    let uri = o.Serialize();
+    println!("URI is {}", uri.to_str().unwrap());
+}
 ```
 
 See [demo/src/main.rs](demo/src/main.rs) for a basic example, and the [examples](examples/) directory for more.
@@ -181,7 +173,7 @@ RUST_BACKTRACE=1 RUST_LOG=autocxx_engine=info cargo test  integration_tests::tes
 ```
 
 This is especially valuable to see the `bindgen` output Rust code, and then the converted Rust code which we pass into cxx. Usually, most problems are due to some mis-conversion somewhere
-in `engine/src/conversion`. See [here](https://docs.rs/autocxx-engine/latest/autocxx_engine/struct.IncludeCpp.html) for documentation and diagrams on how the engine works.
+in `engine/src/conversion`. See [here](https://docs.rs/autocxx-engine/latest/autocxx_engine/struct.IncludeCppEngine.html) for documentation and diagrams on how the engine works.
 
 # Reporting bugs
 
@@ -201,7 +193,8 @@ order of preference here's how we would like to hear about your problem:
 * Use the C++ preprocessor to give a single complete C++ file which demonstrates
   the problem, along with the `include_cpp!` directive you use.
   Alternatively, run your build using `AUTOCXX_PREPROCESS=output.h` which should
-  put everything we need into `output.h`.
+  put everything we need into `output.h`. If necessary, you can use the `CLANG_PATH`
+  or `CXX` environment variables to specify the path to the Clang compiler to use.
 * Failing all else, build using
   `cargo clean -p <your package name> && RUST_LOG=autocxx_engine=info cargo build -vvv`
   and send the _entire_ log to us. This will include two key bits of logging:
