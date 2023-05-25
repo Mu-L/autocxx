@@ -33,6 +33,7 @@
 
     </head>
     <body>
+    <div id="body-container">
         <!-- Provide site root to javascript -->
         <script>
             var path_to_root = "";
@@ -70,10 +71,12 @@
         <!-- Hide / unhide sidebar before it is displayed -->
         <script>
             var html = document.querySelector('html');
-            var sidebar = 'hidden';
+            var sidebar = null;
             if (document.body.clientWidth >= 1080) {
                 try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
                 sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
             }
             html.classList.remove('sidebar-visible');
             html.classList.add("sidebar-" + sidebar);
@@ -240,11 +243,11 @@ sometimes extra steps are required to handle cases like null pointers or convert
 <p>The rest of this 'getting started' section assumes Cargo - if you're using something else, see the <a href="building.html">building</a> section.</p>
 <p>First, add <code>autocxx</code> <em>and <code>cxx</code></em> to your <code>dependencies</code> and <code>autocxx-build</code> to your <code>build-dependencies</code> in your <code>Cargo.toml</code>. <strong>You must specify both.</strong></p>
 <pre><code class="language-toml">[dependencies]
-autocxx = &quot;0.23.1&quot;
+autocxx = &quot;0.25.0&quot;
 cxx = &quot;1.0&quot;
 
 [build-dependencies]
-autocxx-build = &quot;0.23.1&quot;
+autocxx-build = &quot;0.25.0&quot;
 miette = { version = &quot;5&quot;, features = [&quot;fancy&quot;] } # optional but gives nicer error messages!
 </code></pre>
 <p>Now, add a <code>build.rs</code> next to your <code>Cargo.toml</code> (this is a standard <code>cargo</code> <a href="https://doc.rust-lang.org/cargo/reference/build-scripts.html">build script</a>). This is where you need your include path:</p>
@@ -1381,7 +1384,7 @@ fn main() {
 <li><a href="https://github.com/google/autocxx/tree/main/examples/s2">S2 example</a> - example using S2 geometry library</li>
 <li><a href="https://github.com/google/autocxx/tree/main/examples/steam-mini">Steam example</a> - example using (something like) the Steam client library</li>
 <li><a href="https://github.com/google/autocxx/tree/main/examples/subclass">Subclass example</a> - example using subclasses</li>
-<li><a href="https://github.com/google/autocxx/blob/main/integration-tests/src/tests.rs">Integration tests</a>
+<li><a href="https://github.com/google/autocxx/blob/main/integration-tests/tests/integration_test.rs">Integration tests</a>
 <ul>
 <li>hundreds of small snippets</li>
 </ul>
@@ -1449,7 +1452,11 @@ in the test suite. With suitable options, you can get plenty of output. For inst
 </code></pre>
 <p>This is especially valuable to see the <code>bindgen</code> output Rust code, and then the converted Rust code which we pass into cxx. Usually, most problems are due to some mis-conversion somewhere
 in <code>engine/src/conversion</code>. See <a href="https://docs.rs/autocxx-engine/latest/autocxx_engine/struct.IncludeCppEngine.html">here</a> for documentation and diagrams on how the engine works.</p>
-<p>You may also wish to set <code>AUTOCXX_ASAN=1</code> on Linux when running tests.</p>
+<p>You may also wish to set <code>AUTOCXX_ASAN=1</code> on Linux when running tests. To exercise all
+the code paths related to generating both C++ and Rust side shims, you can set
+<code>AUTOCXX_FORCE_WRAPPER_GENERATION=1</code>. The test suite doesn't do this by default because
+we also want to test the normal code paths. (In the future we might want to
+parameterize the test suite to do both.)</p>
 <h2 id="reporting-bugs"><a class="header" href="#reporting-bugs">Reporting bugs</a></h2>
 <p>If you've found a problem, and you're reading this, <em>thank you</em>! Your diligence
 in reporting the bug is much appreciated and will make <code>autocxx</code> better. In
@@ -1473,6 +1480,15 @@ and send the <em>entire</em> log to us. This will include two key bits of loggin
 the C++ bindings as distilled by <code>bindgen</code>, and then the version which
 we've converted and moulded to be suitable for use by <code>cxx</code>.</li>
 </ul>
+<h2 id="bugs-related-to-linking-problems"><a class="header" href="#bugs-related-to-linking-problems">Bugs related to linking problems</a></h2>
+<p>Unfortunately, <em>linking</em> C++ binaries is a complex area subject in itself, and
+we won't be able to debug your linking issues by means of an autocxx bug report.
+Assuming you're using autocxx's build.rs support, the actual C++ build and
+managed by the <a href="https://crates.io/crates/cc"><code>cc</code></a> crate. You can find
+many of its options on its <a href="https://docs.rs/cc/latest/cc/struct.Build.html"><code>Build</code> type</a>.
+If you need to bring in an external library, you may also need to emit certain
+<a href="https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-link-lib">print statements from your <code>build.rs</code></a>
+to instruct cargo to link against that library.</p>
 <h2 id="how-to-contribute-to-this-manual"><a class="header" href="#how-to-contribute-to-this-manual">How to contribute to this manual</a></h2>
 <p>More examples in this manual are <em>very</em> welcome!</p>
 <p>Because <code>autocxx</code> examples require both Rust and C++ code to be linked together,
@@ -1569,5 +1585,6 @@ be found at <a href="https://opensource.google/conduct/">https://opensource.goog
         });
         </script>
 
+    </div>
     </body>
 </html>
