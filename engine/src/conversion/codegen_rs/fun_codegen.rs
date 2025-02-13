@@ -16,13 +16,13 @@ use syn::{
     parse_quote,
     punctuated::Punctuated,
     token::{Comma, Unsafe},
-    Attribute, FnArg, ForeignItem, Ident, ImplItem, Item, ReturnType,
+    Attribute, ForeignItem, Ident, ImplItem, Item, ReturnType,
 };
 
 use super::{
     function_wrapper_rs::RustParamConversion,
     maybe_unsafes_to_tokens,
-    unqualify::{unqualify_params, unqualify_ret_type},
+    unqualify::{unqualify_params_minisyn, unqualify_ret_type},
     ImplBlockDetails, MaybeUnsafeStmt, RsCodegenResult, TraitImplBlockDetails, Use,
 };
 use crate::{
@@ -32,9 +32,8 @@ use crate::{
             MethodKind, RustRenameStrategy, TraitMethodDetails,
         },
         api::UnsafetyNeeded,
-        CppEffectiveName,
     },
-    minisyn::minisynize_vec,
+    minisyn::{minisynize_vec, FnArg},
     types::{Namespace, QualifiedName},
 };
 use crate::{
@@ -89,7 +88,6 @@ pub(super) fn gen_function(
     ns: &Namespace,
     fun: FuncToConvert,
     analysis: FnAnalysis,
-    cpp_call_name: CppEffectiveName,
     non_pod_types: &HashSet<QualifiedName>,
 ) -> RsCodegenResult {
     if analysis.ignore_reason.is_err() || !analysis.externally_callable {
@@ -97,6 +95,7 @@ pub(super) fn gen_function(
     }
     let cxxbridge_name = analysis.cxxbridge_name;
     let rust_name = &analysis.rust_name;
+    let cpp_call_name = &analysis.cpp_call_name;
     let ret_type = analysis.ret_type;
     let ret_conversion = analysis.ret_conversion;
     let param_details = analysis.param_details;
@@ -177,10 +176,13 @@ pub(super) fn gen_function(
             _ => Some(Use::UsedFromCxxBridge),
         },
     };
-    if cpp_call_name.does_not_match_cxxbridge_name(&cxxbridge_name) && !wrapper_function_needed {
-        cpp_name_attr = Attribute::parse_outer
-            .parse2(cpp_call_name.generate_cxxbridge_name_attribute())
-            .unwrap();
+    if let Some(cpp_call_name) = cpp_call_name {
+        if cpp_call_name.does_not_match_cxxbridge_name(&cxxbridge_name) && !wrapper_function_needed
+        {
+            cpp_name_attr = Attribute::parse_outer
+                .parse2(cpp_call_name.generate_cxxbridge_name_attribute())
+                .unwrap();
+        }
     }
 
     // Finally - namespace support. All the Types in everything
@@ -191,7 +193,7 @@ pub(super) fn gen_function(
     // well-known types should be unqualified already (e.g. just UniquePtr)
     // and the following code will act to unqualify only those types
     // which the user has declared.
-    let params = unqualify_params(params);
+    let params = unqualify_params_minisyn(params);
     let ret_type = unqualify_ret_type(ret_type.into_owned());
     // And we need to make an attribute for the namespace that the function
     // itself is in.
