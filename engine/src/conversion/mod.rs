@@ -20,17 +20,19 @@ mod parse;
 mod type_helpers;
 mod utilities;
 
-pub(crate) use crate::conversion::parse::CppOriginalName;
+pub(crate) use super::parse_callbacks::CppOriginalName;
 use analysis::fun::FnAnalyzer;
+use autocxx_bindgen::callbacks::Visibility as CppVisibility;
 use autocxx_parser::IncludeCppConfig;
 pub(crate) use codegen_cpp::CppCodeGenerator;
 pub(crate) use convert_error::ConvertError;
-use convert_error::ConvertErrorFromCpp;
+use convert_error::{ConvertErrorFromCpp, ConvertErrorWithContext, ErrorContext};
 use itertools::Itertools;
-use quote::quote;
 use syn::{Item, ItemMod};
 
-use crate::{minisyn::Ident, types::QualifiedName, CodegenOptions, CppFilePair, UnsafePolicy};
+use crate::{
+    types::QualifiedName, CodegenOptions, CppFilePair, ParseCallbackResults, UnsafePolicy,
+};
 
 use self::{
     analysis::{
@@ -107,6 +109,7 @@ impl<'a> BridgeConverter<'a> {
     pub(crate) fn convert(
         &self,
         mut bindgen_mod: ItemMod,
+        parse_callback_results: ParseCallbackResults,
         unsafe_policy: UnsafePolicy,
         inclusions: String,
         codegen_options: &CodegenOptions,
@@ -117,7 +120,7 @@ impl<'a> BridgeConverter<'a> {
             Some((_, items)) => {
                 // Parse the bindgen mod.
                 let items_to_process = std::mem::take(items);
-                let parser = ParseBindgen::new(self.config);
+                let parser = ParseBindgen::new(self.config, &parse_callback_results);
                 let apis = parser.parse_items(items_to_process, source_file_contents)?;
                 Self::dump_apis("parsing", &apis);
                 // Inside parse_results, we now have a list of APIs.
@@ -125,7 +128,7 @@ impl<'a> BridgeConverter<'a> {
                 // First, convert any typedefs.
                 // "Convert" means replacing bindgen-style type targets
                 // (e.g. root::std::unique_ptr) with cxx-style targets (e.g. UniquePtr).
-                let apis = convert_typedef_targets(self.config, apis);
+                let apis = convert_typedef_targets(self.config, apis, &parse_callback_results);
                 Self::dump_apis("typedefs", &apis);
                 // Now analyze which of them can be POD (i.e. trivial, movable, pass-by-value
                 // versus which need to be opaque).
@@ -133,8 +136,8 @@ impl<'a> BridgeConverter<'a> {
                 // POD really are POD, and duly mark any dependent types.
                 // This returns a new list of `Api`s, which will be parameterized with
                 // the analysis results.
-                let analyzed_apis =
-                    analyze_pod_apis(apis, self.config).map_err(ConvertError::Cpp)?;
+                let analyzed_apis = analyze_pod_apis(apis, self.config, &parse_callback_results)
+                    .map_err(ConvertError::Cpp)?;
                 Self::dump_apis("pod analysis", &analyzed_apis);
                 let analyzed_apis = replace_hopeless_typedef_targets(self.config, analyzed_apis);
                 let analyzed_apis = add_casts(analyzed_apis);
@@ -212,41 +215,35 @@ impl<'a> BridgeConverter<'a> {
 
 /// Newtype wrapper for a C++ "effective name", i.e. the name we'll use
 /// when generating C++ code.
+/// This name may contain several segments if it's an inner type,
+/// e.g.
+/// ```cpp
+/// struct Outer {
+///   struct Inner {
+///   }
+/// }
+/// ```
 /// At present these various newtype wrappers for kinds of names
 /// (Rust, C++, cxx::bridge) have various conversions between them that
 /// are probably not safe. They're marked with FIXMEs. Over time we should
 /// remove them, or make them safe by doing name validation at the point
 /// of conversion.
 #[derive(PartialEq, PartialOrd, Eq, Hash, Clone, Debug)]
-pub struct CppEffectiveName(String);
+pub struct CppEffectiveName(pub(crate) String);
 impl CppEffectiveName {
     /// FIXME: document what we're doing here, just as soon as I've figured
     /// it out
-    fn from_cpp_name_and_rust_name(cpp_name: Option<&CppEffectiveName>, rust_name: &str) -> Self {
-        cpp_name.cloned().unwrap_or(Self(rust_name.to_string()))
+    fn from_cpp_name_and_rust_name(cpp_name: Option<&CppOriginalName>, rust_name: &str) -> Self {
+        cpp_name
+            .map(|cpp| cpp.to_effective_name())
+            .unwrap_or(Self(rust_name.to_string()))
     }
 
     fn from_api_details(original_name: &Option<CppOriginalName>, api_name: &QualifiedName) -> Self {
-        Self::from_cpp_name_and_rust_name(
-            original_name
-                .as_ref()
-                .map(|on| on.to_effective_name())
-                .as_ref(),
-            api_name.get_final_item(),
-        )
-    }
-
-    /// Return the string inside for validation purposes.
-    pub(crate) fn for_validation(&self) -> &str {
-        &self.0
+        Self::from_cpp_name_and_rust_name(original_name.as_ref(), api_name.get_final_item())
     }
 
     fn to_string_for_cpp_generation(&self) -> &str {
-        &self.0
-    }
-
-    /// FIXME: the output here is not just used for diagnostics.
-    pub(crate) fn diagnostic_display_name(&self) -> &str {
         &self.0
     }
 
@@ -256,14 +253,10 @@ impl CppEffectiveName {
         Self(rust_call_name)
     }
 
-    /// Work out what to call a Rust-side API given a C++-side name.
-    fn to_string_for_rust_name(&self) -> String {
-        self.0.clone()
-    }
-
-    /// FIXME: work out why we're creating C++ names from Rust cxx::bridge
-    /// names.
-    fn from_cxxbridge_name(cxxbridge_name: crate::minisyn::Ident) -> CppEffectiveName {
+    /// It seems as though we record the C++ name that subclasses need
+    /// to call back into. That might be a call into the cxx API (?)
+    /// and that's why we create a CppEffectiveName from a Rust name like this.
+    fn from_cxxbridge_name(cxxbridge_name: &crate::minisyn::Ident) -> CppEffectiveName {
         Self(cxxbridge_name.to_string())
     }
 
@@ -283,20 +276,27 @@ impl CppEffectiveName {
     fn is_nested(&self) -> bool {
         self.0.contains("::")
     }
+}
 
-    /// FIXME: shouldn't be needed
-    fn to_string_to_make_qualified_name(&self) -> &str {
-        &self.0
-    }
-
-    pub(crate) fn does_not_match_cxxbridge_name(&self, cxxbridge_name: &Ident) -> bool {
-        *cxxbridge_name != self.to_string_for_rust_name()
-    }
-
-    pub(crate) fn generate_cxxbridge_name_attribute(&self) -> proc_macro2::TokenStream {
-        let cpp_call_name = &self.to_string_for_rust_name();
-        quote!(
-            #[cxx_name = #cpp_call_name]
-        )
+/// Some attributes indicate we can never handle a given item. Check for those.
+fn check_for_fatal_attrs(
+    callback_results: &ParseCallbackResults,
+    name: &QualifiedName,
+) -> Result<(), ConvertErrorWithContext> {
+    if callback_results.discards_template_param(name) {
+        Err(ConvertErrorWithContext(
+            ConvertErrorFromCpp::UnusedTemplateParam,
+            Some(ErrorContext::new_for_item(name.get_final_ident())),
+        ))
+    } else if !matches!(
+        callback_results.get_cpp_visibility(name),
+        CppVisibility::Public
+    ) {
+        Err(ConvertErrorWithContext(
+            ConvertErrorFromCpp::NonPublicNestedType,
+            Some(ErrorContext::new_for_item(name.get_final_ident())),
+        ))
+    } else {
+        Ok(())
     }
 }

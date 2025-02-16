@@ -14,6 +14,7 @@ mod namespace_organizer;
 mod non_pod_struct;
 pub(crate) mod unqualify;
 
+use autocxx_bindgen::callbacks::Layout;
 use indexmap::map::IndexMap as HashMap;
 use indexmap::set::IndexSet as HashSet;
 
@@ -51,7 +52,7 @@ use super::{
     doc_attr::get_doc_attrs,
 };
 use super::{
-    api::{Layout, Provenance, RustSubclassFnDetails, SuperclassMethod, TraitImplSignature},
+    api::{Provenance, RustSubclassFnDetails, SuperclassMethod, TraitImplSignature},
     apivec::ApiVec,
     codegen_cpp::type_to_cpp::CppNameMap,
 };
@@ -464,7 +465,6 @@ impl<'a> RsCodeGenerator<'a> {
     ) -> RsCodegenResult {
         let name = api.name().clone();
         let id = name.get_final_ident();
-        let cpp_call_name = api.effective_cpp_name();
         match api {
             Api::StringConstructor { .. } => {
                 let make_string_name = make_ident(self.config.get_makestring_name());
@@ -479,13 +479,9 @@ impl<'a> RsCodeGenerator<'a> {
                     ..Default::default()
                 }
             }
-            Api::Function { fun, analysis, .. } => gen_function(
-                name.get_namespace(),
-                *fun,
-                analysis,
-                cpp_call_name,
-                non_pod_types,
-            ),
+            Api::Function { fun, analysis, .. } => {
+                gen_function(name.get_namespace(), *fun, analysis, non_pod_types)
+            }
             Api::Const { const_item, .. } => RsCodegenResult {
                 bindgen_mod_items: vec![Item::Const(const_item.into())],
                 materializations: vec![Use::UsedFromBindgen],
@@ -513,7 +509,7 @@ impl<'a> RsCodeGenerator<'a> {
                 ..
             } => {
                 let doc_attrs = get_doc_attrs(&details.item.attrs);
-                let layout = details.layout.clone();
+                let layout = details.layout;
                 self.generate_type(
                     &name,
                     id,
